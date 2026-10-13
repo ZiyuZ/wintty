@@ -1111,6 +1111,7 @@ pub const StreamHandler = struct {
             // no page memory, so the page is always 1.
             .cursor_position_extended => {
                 const pos = self.cursorReportPos();
+
                 var msg: termio.Message = .{ .write_small = .{} };
                 const resp = try std.fmt.bufPrint(&msg.write_small.data, "\x1B[?{};{};1R", .{
                     pos.y + 1,
