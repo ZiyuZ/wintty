@@ -281,4 +281,373 @@ public class ThemeFlipWiringTests
                 $"{writer.Identifier.ValueText} writes TabView resources without marking them dirty");
         }
     }
+
+    // ------------------------------------------------------------------
+    // The resolved-theme landing. A theme preview applies its palette
+    // synchronously, but WindowThemeManager resolves the light/dark answer
+    // (window-theme unset means "auto", which reads the background's
+    // luminance) on a LATER dispatcher turn, and only announces it when it
+    // actually flipped. The horizontal strip's unselected titles are a
+    // cached brush scored against a ground estimate that blends that
+    // polarity, and nothing re-pushes the ground when the flip lands: the
+    // titles kept the ink picked for the outgoing polarity on a strip whose
+    // surface ApplyTheme had just darkened. A second dark theme re-derived
+    // the ink through the synchronous config pass, which is why going to
+    // another dark theme and back fixed it. The vertical strip never saw
+    // it: its unselected rows follow the element theme's own resources, so
+    // the same flip re-resolves them for free.
+    // ------------------------------------------------------------------
+
+    private static ShellSource Window() => ShellSource.Load("MainWindow.xaml.cs");
+    private static ShellSource Manager() => ShellSource.Load("Services.WindowThemeManager.cs");
+
+    [Fact]
+    public void OnWindowThemeChanged_TheLandedPolarityRepaintsTheGround()
+    {
+        // The landing handler is the only place the deferred flip arrives.
+        // Both pushes are pinned through the shared shape checker: exactly
+        // one call each, a direct top-level statement of the handler's own
+        // body, with no return anywhere above it.
+        var handler = Window().Method("OnWindowThemeChanged");
+        foreach (var callee in new[] { "ApplyTheme", "RefreshBackdropChrome" })
+            CallShape.TopLevelCall(handler, callee);
+    }
+
+    [Fact]
+    public void RefreshBackdropChrome_StillReachesTheStripsGroundPush()
+    {
+        // The chain the repaint above rides. Breaking any link silently
+        // turns the handler's push into a no-op.
+        var window = Window();
+        Assert.NotEmpty(
+            window.Method("RefreshBackdropChrome").Calls("ApplyVerticalTitleBarChrome"));
+        Assert.NotEmpty(
+            window.Method("ApplyVerticalTitleBarChrome").Calls("ApplyChromeSeparators"));
+        Assert.NotEmpty(
+            window.Method("ApplyChromeSeparators").CallsEndingWith("SetChromeGround"));
+    }
+
+    [Fact]
+    public void SetChromeGround_TheInkPassesRunOnEveryPush()
+    {
+        // The invariant: the ink passes are unconditional and the ground's
+        // landed value is written before they run, top-level and ungated.
+        // The polarity behind the estimate can flip without moving the
+        // value (a tint-opacity near 1.0 rounds the base's contribution
+        // away, so a light->dark pair with the same background lands
+        // byte-identical) while the strip's surface still repaints, so any
+        // guarded skip is the stale ink back -- whatever the guard is
+        // named.
+        var method = Host().Method("SetChromeGround");
+        Assert.NotEmpty(method.AssignsTo("_chromeGroundPacked"));
+
+        var passes = method.Calls("RefreshShellInactiveInk")
+            .Concat(method.Calls("RefreshTabColors"))
+            .ToList();
+        Assert.True(passes.Count == 2,
+            $"expected one ink pass per arm, found {passes.Count}");
+        var firstPass = passes.MinBy(p => p.Span.Start)!;
+        CallShape.NoReturnBefore(method.Body!, firstPass);
+
+        CallShape.TopLevelWrite(method, "_stripBackdropPacked");
+        CallShape.NoGuardedArm(method);
+        CallShape.GroundWritePrecedesFirstPass(method);
+    }
+
+    [Fact]
+    public void TheGroundKeyedBrushes_AreMemoizedOnThePackedGround()
+    {
+        // Compare-then-refresh, with the key pinned at the node: each memo
+        // is assigned the ground it was derived from, inside the same arm
+        // that derives the brush. A broken cache (the key write skipped)
+        // fails the Single, and a key that ignores the ground (any right
+        // side but the ground itself) fails the equality, so a cached
+        // answer can only ever be refreshed by a ground that moved.
+        var ink = Host().Method("MutedInkBrush");
+        var inkGuard = Assert.Single(ink.Body!.Statements.OfType<IfStatementSyntax>());
+        var inkCondition = inkGuard.Condition.DescendantNodesAndSelf()
+            .OfType<IdentifierNameSyntax>()
+            .Select(id => id.Identifier.ValueText)
+            .ToList();
+        Assert.Contains("_mutedInkGround", inkCondition);
+        Assert.Contains("ground", inkCondition);
+        Assert.Equal("ground",
+            Assert.Single(inkGuard.AssignsTo("_mutedInkGround")).Right.ToString());
+        Assert.NotEmpty(inkGuard.AssignsTo("_mutedInkBrush"));
+
+        var wash = Host().Method("GroupWashBrush");
+        var washGuard = Assert.Single(wash.Body!.Statements.OfType<IfStatementSyntax>());
+        var washCondition = washGuard.Condition.DescendantNodesAndSelf()
+            .OfType<IdentifierNameSyntax>()
+            .Select(id => id.Identifier.ValueText)
+            .ToList();
+        Assert.Contains("_groupWashGround", washCondition);
+        Assert.Contains("_stripBackdropPacked", washCondition);
+        // Node-exact polarity: the refresh decision is a NotEquals between
+        // the two, so a gutted `is null` and an inverted `==` both fail.
+        var washCompare = Assert.IsType<BinaryExpressionSyntax>(
+            washGuard.Condition.DescendantNodesAndSelf()
+                .First(n => n is BinaryExpressionSyntax b
+                    && b.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.NotEqualsExpression)));
+        Assert.Equal("_groupWashGround", washCompare.Left.ToString());
+        Assert.Equal("_stripBackdropPacked", washCompare.Right.ToString());
+        Assert.Equal("_stripBackdropPacked",
+            Assert.Single(washGuard.AssignsTo("_groupWashGround")).Right.ToString());
+        Assert.NotEmpty(washGuard.AssignsTo("_groupWashBrush"));
+    }
+
+    [Fact]
+    public void WindowThemeManager_TheConfigDrivenResolveIsDeferred()
+    {
+        // The deferral that makes the landing a separate turn from the
+        // config fan-out. If the resolve ever moves inline, the landing
+        // handler's push stops being the fix and this file's premise needs
+        // another look.
+        Assert.NotEmpty(Manager().Method("OnConfigChanged").CallsEndingWith("TryEnqueue"));
+    }
+
+    // The handler body is half the fix; the two subscription lines that
+    // carry the flip into it are the other half. A dropped or
+    // lambda-replaced subscription reintroduces the stale ground with every
+    // body fact above still green, so both wires are pinned as assignment
+    // nodes: an IdentifierNameSyntax right-hand side refuses the lambda
+    // shape a text match would wave through.
+
+    [Fact]
+    public void MainWindow_TheLandingHandlerIsSubscribedToTheManager()
+    {
+        var hits = Window().Root.DescendantNodes()
+            .OfType<AssignmentExpressionSyntax>()
+            .Where(a => a.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.AddAssignmentExpression)
+                        && a.Left is MemberAccessExpressionSyntax m
+                        && m.Expression.ToString() == "_themeManager"
+                        && m.Name.Identifier.ValueText == "ThemeChanged"
+                        && a.Right is IdentifierNameSyntax id
+                        && id.Identifier.ValueText == "OnWindowThemeChanged")
+            .ToList();
+        Assert.True(hits.Count == 1,
+            $"expected exactly one _themeManager.ThemeChanged += OnWindowThemeChanged, "
+                + $"found {hits.Count}");
+    }
+
+    [Fact]
+    public void WindowThemeManager_TheConfigDrivenSubscriptionIsLive()
+    {
+        // Add-only: Dispose's -= is the teardown of the same wire and must
+        // not count, so the kind is pinned, not just the operands.
+        var hits = Manager().Root.DescendantNodes()
+            .OfType<AssignmentExpressionSyntax>()
+            .Where(a => a.IsKind(Microsoft.CodeAnalysis.CSharp.SyntaxKind.AddAssignmentExpression)
+                        && a.Left is MemberAccessExpressionSyntax m
+                        && m.Expression.ToString() == "_configService"
+                        && m.Name.Identifier.ValueText == "ConfigChanged"
+                        && a.Right is IdentifierNameSyntax id
+                        && id.Identifier.ValueText == "OnConfigChanged")
+            .ToList();
+        Assert.True(hits.Count == 1,
+            $"expected exactly one _configService.ConfigChanged += OnConfigChanged, "
+                + $"found {hits.Count}");
+    }
+
+    [Fact]
+    public void ResolveAndNotifyIfChanged_TheResolvePrecedesTheAnnouncement()
+    {
+        // The announcement is only honest with the freshly resolved answer:
+        // OnWindowThemeChanged's push reads _themeManager.IsDarkMode, so a
+        // swap that invokes first would push the outgoing polarity's ground
+        // exactly when the handler exists to fix that.
+        var method = Manager().Method("ResolveAndNotifyIfChanged");
+        var resolve = Assert.Single(method.Calls("Resolve"));
+        var announce = Assert.Single(method.CallsEndingWith("ThemeChanged?.Invoke"));
+        Assert.True(resolve.Span.Start < announce.Span.Start,
+            "ThemeChanged is invoked before Resolve()");
+    }
+
+    [Fact]
+    public void TheMemoizedBrushes_AreOnlyEverWrittenWhole()
+    {
+        // Whole-instance writes only. A member mutation on a memoized brush
+        // (.Opacity =, .Color =, ...) leaks through the cache to every
+        // consumer the instance is shared with, and survives until the
+        // ground changes -- a stateful brush wearing the cache's permanence.
+        // Receivers watched: the three fields themselves, and any local
+        // whose initializer is exactly one of them.
+        var source = Host().Root;
+        var brushFields = new[] { "_mutedInkBrush", "_groupWashBrush", "_shellInactiveTextBrush" };
+
+        Assert.Empty(source.DescendantNodes()
+            .OfType<AssignmentExpressionSyntax>()
+            .Where(a => a.Left is MemberAccessExpressionSyntax m
+                        && m.Expression is IdentifierNameSyntax id
+                        && brushFields.Contains(id.Identifier.ValueText)));
+
+        var holders = source.DescendantNodes()
+            .OfType<VariableDeclaratorSyntax>()
+            .Where(v => v.Initializer?.Value is IdentifierNameSyntax id
+                        && brushFields.Contains(id.Identifier.ValueText))
+            .Select(v => v.Identifier.ValueText)
+            .ToHashSet();
+        Assert.Empty(source.DescendantNodes()
+            .OfType<AssignmentExpressionSyntax>()
+            .Where(a => a.Left is MemberAccessExpressionSyntax m
+                        && m.Expression is IdentifierNameSyntax id
+                        && holders.Contains(id.Identifier.ValueText)));
+    }
+
+    [Fact]
+    public void TheTwoMutedInkCopies_DeriveWithTheSameConstant()
+    {
+        // One side memoized, one not: if the formulas or the alpha drift,
+        // the strips visibly diverge after a flip. Both copies must call
+        // ThemeResolution.ReadableMutedForeground with the shared
+        // InactiveInkAlpha constant, and the two constants must spell the
+        // same literal.
+        var host = Host().Method("MutedInkBrush");
+        var strip = ShellSource.Load("Tabs.VerticalTabStrip.xaml.cs").Method("MutedInkBrush");
+
+        foreach (var copy in new[] { host, strip })
+        {
+            Assert.NotEmpty(copy.CallsEndingWith("ReadableMutedForeground"));
+            Assert.NotEmpty(copy.DescendantNodes()
+                .OfType<IdentifierNameSyntax>()
+                .Where(id => id.Identifier.ValueText == "InactiveInkAlpha"));
+        }
+
+        var hostAlpha = Host().Field("InactiveInkAlpha");
+        var stripAlpha = ShellSource.Load("Tabs.VerticalTabStrip.xaml.cs")
+            .Field("InactiveInkAlpha");
+        Assert.Equal(
+            hostAlpha.Variable.Initializer!.Value.ToString(),
+            stripAlpha.Variable.Initializer!.Value.ToString());
+    }
+}
+
+/// <summary>
+/// The shared unconditionality checker behind the theme-flip facts. One
+/// implementation, many pinned shapes: every guard shape this file has to
+/// reject -- braced or braceless wraps, lambda assignments, returns above a
+/// call in any nesting, ground-conditioned skips, reordered writes -- must
+/// fail exactly one of these checks, or a future shape walks through.
+/// </summary>
+internal static class CallShape
+{
+    // (1) The call is a direct top-level ExpressionStatement of the method
+    // body. A braced if/try/using/lock/switch interposes its own block; a
+    // braceless if or an expression-lambda assignment interposes itself.
+    // Containment walks pass all of them; the parent chain cannot.
+    // (2) No return anywhere in the body's subtree -- else clauses
+    // included -- closes before the call starts.
+    public static void TopLevelCall(MethodDeclarationSyntax method, string callee)
+    {
+        var body = method.Body!;
+        var calls = method.Calls(callee);
+        Assert.True(calls.Count == 1,
+            $"expected exactly one {callee} call in {method.Identifier.ValueText}, "
+                + $"found {calls.Count}");
+        var call = calls[0];
+
+        Assert.IsType<ExpressionStatementSyntax>(call.Parent);
+        var callStatement = (StatementSyntax)call.Parent;
+        Assert.Same(body, callStatement.Parent);
+        NoReturnBefore(body, callStatement);
+    }
+
+    // (2) alone, for a call that legitimately lives inside an arm.
+    public static void NoReturnBefore(SyntaxNode scope, SyntaxNode call)
+    {
+        Assert.Empty(scope.DescendantNodesAndSelf().OfType<ReturnStatementSyntax>()
+            .Where(r => r.Span.End <= call.Span.Start));
+    }
+
+    // (3) Structural guard sweep: every if in the method EXCEPT the named
+    // shell-dispatch if (whose condition is spelled exactly below) must
+    // hold neither a return nor any invocation in ANY arm -- statement,
+    // else clause, or braceless embedded statement. Name-independent, so a
+    // guard wearing a fresh local's name (`if (unchanged) return;`) is
+    // caught the same as the memo-shaped ones. The three-name watch set
+    // stays as belt, in case the exemption above is ever widened: an if
+    // conditioned on the ground memo, the landed value, or the input memo
+    // may hold no return and no ink pass whatever its shape.
+    public static void NoGuardedArm(MethodDeclarationSyntax method)
+    {
+        foreach (var guard in method.Body!.DescendantNodes().OfType<IfStatementSyntax>())
+        {
+            if (guard.Condition.ToString() == "_shellActiveTextBrush is not null")
+                continue;
+
+            Assert.Empty(GuardArmReturns(guard.Statement));
+            Assert.Empty(GuardArmInvocations(guard.Statement));
+            if (guard.Else is { } elseClause)
+            {
+                Assert.Empty(GuardArmReturns(elseClause.Statement));
+                Assert.Empty(GuardArmInvocations(elseClause.Statement));
+            }
+        }
+
+        var watched = method.Body!.DescendantNodes().OfType<IfStatementSyntax>()
+            .Where(i => i.Condition.DescendantNodesAndSelf()
+                .OfType<IdentifierNameSyntax>()
+                .Any(id => id.Identifier.ValueText is "groundChanged"
+                    or "_stripBackdropPacked" or "_chromeGroundPacked"));
+        foreach (var guard in watched)
+        {
+            Assert.Empty(GuardArmReturns(guard.Statement));
+            Assert.Empty(GuardArmPasses(guard.Statement));
+            if (guard.Else is { } elseClause)
+            {
+                Assert.Empty(GuardArmReturns(elseClause.Statement));
+                Assert.Empty(GuardArmPasses(elseClause.Statement));
+            }
+        }
+    }
+
+    // (5) The named write is a direct top-level statement of the method
+    // body: the gated `if (groundChanged) write;` and the ternary spelling
+    // `field = cond ? a : b;` both interpose -- an if or a conditional
+    // expression between the write and the body -- and fail here.
+    public static void TopLevelWrite(MethodDeclarationSyntax method, string field)
+    {
+        var body = method.Body!;
+        var landing = Assert.Single(method.AssignsTo(field));
+        Assert.IsType<ExpressionStatementSyntax>(landing.Parent);
+        var writeStatement = (StatementSyntax)landing.Parent;
+        Assert.Same(body, writeStatement.Parent);
+        Assert.Empty(landing.Ancestors().TakeWhile(a => a != body)
+            .OfType<IfStatementSyntax>());
+        // The ternary spelling keeps the statement top-level but carries
+        // the conditional inside it, so the statement's own subtree is
+        // swept as well as the path above it.
+        Assert.Empty(writeStatement.DescendantNodesAndSelf()
+            .OfType<ConditionalExpressionSyntax>());
+    }
+
+    // (4) The ground's landed value must precede the first pass that reads
+    // it. The shell arm's own pass legitimately runs before the default
+    // arm's landing (that arm exits first), so the readers that matter are
+    // the default arm's: a swap that lands the write after them scores
+    // them against the outgoing value.
+    public static void GroundWritePrecedesFirstPass(MethodDeclarationSyntax method)
+    {
+        var landing = Assert.Single(method.AssignsTo("_stripBackdropPacked"));
+        var readers = method.Calls("RefreshTabColors")
+            .Concat(method.Calls("RefreshGroupFieldWash"))
+            .ToList();
+        Assert.NotEmpty(readers);
+        var firstReader = readers.MinBy(p => p.Span.Start)!;
+        Assert.True(landing.Span.Start < firstReader.Span.Start,
+            "the ground write lands after the first pass that reads it");
+    }
+
+    // DescendantNodesAndSelf: a braceless embedded arm IS the return or
+    // the pass, and a bare `return;` has no descendants of its own.
+    private static IEnumerable<ReturnStatementSyntax> GuardArmReturns(StatementSyntax arm)
+        => arm.DescendantNodesAndSelf().OfType<ReturnStatementSyntax>();
+
+    private static IEnumerable<InvocationExpressionSyntax> GuardArmPasses(StatementSyntax arm)
+        => arm.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>()
+            .Where(c => c.CalleeText() is "RefreshShellInactiveInk"
+                or "RefreshTabColors" or "RefreshGroupFieldWash");
+
+    private static IEnumerable<InvocationExpressionSyntax> GuardArmInvocations(StatementSyntax arm)
+        => arm.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>();
 }

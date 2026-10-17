@@ -3604,8 +3604,10 @@ public sealed partial class MainWindow : Window
     /// doubled edge rather than a clearer one. See
     /// <see cref="LegibleChromeAccent"/>.
     ///
-    /// Idempotent and brush-cached, so every input that can move the ground
-    /// may call it.
+    /// Idempotent, and the horizontal strip memoizes its ink against the
+    /// ground it is handed, so every input that can move the ground may
+    /// call it: a re-push with an unchanged value re-applies the same
+    /// cached brush.
     /// </summary>
     private void ApplyChromeSeparators()
     {
@@ -4404,17 +4406,25 @@ public sealed partial class MainWindow : Window
     }
 
     /// <summary>
-    /// ShellThemeService.ThemeChanged handler. Re-applies the shell
-    /// theme (caption buttons, tab hosts, title text) and refreshes
-    /// the single RootGrid.Background source of truth.
-    /// </summary>
-    /// <summary>
     /// WindowThemeManager.ThemeChanged handler. Named (not an anonymous
     /// lambda) so it reads consistently with the other config-driven
     /// handlers; ApplyTheme is itself _isClosed-gated and the manager nulls
     /// the event on dispose, so no teardown guard is needed here.
     /// </summary>
-    private void OnWindowThemeChanged(bool isDark) => ApplyTheme();
+    private void OnWindowThemeChanged(bool isDark)
+    {
+        ApplyTheme();
+        // The manager resolves its light/dark answer on a deferred turn, so
+        // this lands after the config fan-out already repainted the chrome
+        // from the new palette. ApplyTheme flips the surfaces the element
+        // theme resolves, but the strips score their unselected titles
+        // against a ground estimate that blends this polarity, and only the
+        // ground push re-derives that ink: without it, a light theme
+        // previewed onto a dark one kept the outgoing dark ink on the
+        // darkened strip until some unrelated pass happened to re-derive
+        // it, which is why switching to a second dark theme fixed it.
+        RefreshBackdropChrome();
+    }
 
     /// <summary>
     /// UISettings.ColorValuesChanged handler: an OS light/dark flip, accent
@@ -4509,6 +4519,11 @@ public sealed partial class MainWindow : Window
         });
     }
 
+    /// <summary>
+    /// ShellThemeService.ThemeChanged handler. Re-applies the shell
+    /// theme (caption buttons, tab hosts, title text) and refreshes
+    /// the single RootGrid.Background source of truth.
+    /// </summary>
     private void OnShellThemeChanged()
     {
         // Same teardown race as ApplyTheme: ShellThemeService routes its
