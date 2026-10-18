@@ -1530,6 +1530,29 @@ public partial class App : Application
             return;
         }
 
+        // The forwarded -e command is decoded first, on purpose: a launch
+        // that carries a command is a window launch that happens to mention
+        // a URI, and the command keeps the base behaviour (a window running
+        // the tool). Only a launch that is ONLY a URI routes below.
+        var forwardedCommand = Ghostty.Core.SingleInstance.LaunchCommand.FromArgs(req.Args);
+
+        // A wintty:// deep link -- the jump list's Install Pending Update
+        // task, a browser or shell launch -- forwarded by a secondary
+        // reaches here as the same --uri argv a cold start's probe scans
+        // for, and nothing before this point read it: falling through opened
+        // a plain window and dropped the URI. Route it the way the cold path
+        // does and do not go on to the window arms, because a URI launch is
+        // not a window launch. The router it is destined for is constructed
+        // after startup (and only in some build tiers), so the URI latches
+        // for it rather than being delivered inline. A live toast surface
+        // named on the same argv keeps its existing priority above.
+        var forwardedUri = Ghostty.Core.Activation.ProtocolLaunch.ParseUri(req.Args);
+        if (forwardedUri is not null && forwardedCommand is null)
+        {
+            ProtocolActivations.Note(forwardedUri);
+            return;
+        }
+
         var launch = Ghostty.Core.JumpList.JumpListLaunch.Parse(req.Args);
         if (launch.Action == Ghostty.Core.JumpList.JumpListAction.None)
         {
@@ -1537,9 +1560,8 @@ public partial class App : Application
             // cold start makes the argv after -e the first surface's
             // command, so the primary honours it here rather than degrading
             // the launch to the default shell (#1094). Markers keep their
-            // existing priority in the arm below. With no profile named, the
+            // existing priority in the arm above. With no profile named, the
             // pane follows the same rules a cold start's does (#1136).
-            var forwardedCommand = Ghostty.Core.SingleInstance.LaunchCommand.FromArgs(req.Args);
 
             // The first plain launch into a -e process restores the session
             // that process held back, instead of opening a default window.
@@ -1602,6 +1624,19 @@ public partial class App : Application
     // consumer needs exists. App keeps only the WinRT wiring.
     internal static Ghostty.Core.Activation.ToastActivationRelay ToastActivations { get; }
         = new(ex => Ghostty.Logging.StaticLoggers.App.LogToastActivationFailed(ex));
+
+    /// <summary>
+    /// The protocol half of the same story <see cref="ToastActivations"/>
+    /// tells: a <c>wintty://</c> URI can arrive when the only consumer a
+    /// build has for it is not up yet. A cold start hands the probe's URI
+    /// straight to the downstream router; a launch forwarded by a secondary
+    /// arrives through the single-instance pipe instead, where the probe
+    /// never ran (it ran in the secondary that exited), so
+    /// <see cref="OpenWindowFromLaunch"/> latches the URI here for whoever
+    /// subscribes.
+    /// </summary>
+    internal static Ghostty.Core.Activation.ProtocolActivationRelay ProtocolActivations { get; }
+        = new(ex => Ghostty.Logging.StaticLoggers.App.LogProtocolActivationFailed(ex));
 
     /// <summary>
     /// Read what this process was activated for. Both kinds come off the same
@@ -2575,6 +2610,7 @@ public partial class App : Application
                     _toastInvokedSubscribed = false;
                 }
                 ToastActivations.Reset();
+                ProtocolActivations.Reset();
 
                 // Force-close the quake window. It does not participate
                 // in WindowsByRoot (so this branch fires when the last
@@ -2803,6 +2839,12 @@ internal static partial class AppLogExtensions
                    Level = LogLevel.Warning,
                    Message = "A forwarded launch could not be acted on; it was dropped.")]
     internal static partial void LogInboundLaunchFailed(
+        this ILogger<App> logger, System.Exception ex);
+
+    [LoggerMessage(EventId = Ghostty.Logging.LogEvents.SingleInstance.ProtocolActivationFailed,
+                   Level = LogLevel.Warning,
+                   Message = "Failed to act on a forwarded protocol activation")]
+    internal static partial void LogProtocolActivationFailed(
         this ILogger<App> logger, System.Exception ex);
 
     [LoggerMessage(EventId = Ghostty.Logging.LogEvents.Startup.QuakeWindowFailed,
