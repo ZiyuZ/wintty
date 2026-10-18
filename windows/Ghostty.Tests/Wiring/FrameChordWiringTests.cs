@@ -1,3 +1,4 @@
+using System;
 using System.Linq;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Xunit;
@@ -148,5 +149,189 @@ public class FrameChordWiringTests
         var source = ShellSource.Load("MainWindow.FrameChords.cs").Method(method).ToString();
 
         Assert.Contains("_isClosed", source);
+    }
+
+    /// <summary>
+    /// A chord pressed on a strip row names THAT row's tab. The router used
+    /// to hand every matched action to the active surface: with focus on a
+    /// row, close_tab closed a pane of whichever tab happened to be active
+    /// behind the strip, and never raised the close confirmation the row's
+    /// own close button would have.
+    /// </summary>
+    [Fact]
+    public void TabRowChords_TargetTheRow_BeforeTheActiveLeaf()
+    {
+        var dispatch = ShellSource.Load("MainWindow.FrameChords.cs")
+            .Method("TryDispatchFrameChord");
+
+        // The row claim: an if that consults the focused strip row and
+        // hands the action to the row-targeted dispatch.
+        var claim = dispatch.DescendantNodes().OfType<IfStatementSyntax>()
+            .Where(i => i.Condition.ToString().Contains("TryExecuteTabRowAction")
+                        && i.Condition.ToString().Contains("FocusedStripRowTab"))
+            .ToList();
+        Assert.True(
+            claim.Count == 1,
+            "the router must resolve a chord against the focused strip row "
+                + "(FocusedStripRowTab + TryExecuteTabRowAction) before it falls "
+                + "back to the active surface; found " + claim.Count + " such guard(s).");
+
+        // ...and the claim holds the chord, or the key would reach the pane
+        // path too and one press would fire twice.
+        Assert.Contains(
+            claim[0].DescendantNodes().OfType<ReturnStatementSyntax>(),
+            r => r.Expression?.ToString() == "true");
+
+        // The claim binds the resolution to the dispatch: the guard's
+        // pattern designates the row, and THAT designated row is the
+        // argument the row-targeted dispatch receives. A resolution whose
+        // result never reaches the dispatch is the same bug with more code.
+        var designation = Assert.Single(
+            claim[0].Condition.DescendantNodes().OfType<IsPatternExpressionSyntax>()
+                .Where(p => p.Expression.ToString() == "FocusedStripRowTab()")
+                .ToList(),
+            _ => true);
+        Assert.Equal("{ } rowTab", designation.Pattern.ToString());
+        var rowCall = Assert.Single(
+            claim[0].DescendantNodes().OfType<InvocationExpressionSyntax>()
+                .Where(i => i.CalleeText() == "TryExecuteTabRowAction")
+                .ToList(),
+            _ => true);
+        Assert.Equal("rowTab", rowCall.ArgExpression(1).ToString());
+
+        // The active surface stays the fallback, and only the fallback: the
+        // row guard stands before it, so a row-targeted chord can never
+        // reach the leaf.
+        var fallback = Assert.Single(
+            dispatch.Calls("TryExecuteBindingAction").ToList(), _ => true);
+        Assert.True(
+            claim[0].Span.Start < fallback.Span.Start,
+            "the strip-row resolution must precede the active-surface fallback");
+
+        // The row is asked of FOCUS, not of the active tab: the row a chord
+        // was pressed on is the target, and it need not be the active tab.
+        var focus = ShellSource.Load("MainWindow.FrameChords.cs")
+            .Method("FocusedStripRowTab");
+        Assert.Single(focus.Calls("FocusManager.GetFocusedElement").ToList(), _ => true);
+        Assert.Single(focus.CallsEndingWith("TabFromElement").ToList(), _ => true);
+        Assert.DoesNotContain(
+            focus.DescendantNodes().OfType<InvocationExpressionSyntax>(),
+            i => i.CalleeText().Contains("ActiveTab"));
+    }
+
+    /// <summary>
+    /// The row-targeted close rides the same entry the strip's own close
+    /// button uses: RequestCloseTabAsync is where TabCloseConfirmation
+    /// (confirm-close-surface) and the strip focus hand-back live, and a
+    /// second close path would grow its own policy. And only close_tab:this
+    /// may retarget: the sweep modes anchor on the active tab, not the row.
+    /// </summary>
+    [Fact]
+    public void TheTabRowClose_RidesTheConfirmationPath_AndOnlyForThis()
+    {
+        var rowAction = ShellSource.Load("MainWindow.FrameChords.cs")
+            .Method("TryExecuteTabRowAction");
+
+        Assert.Single(rowAction.CallsEndingWith("RequestCloseTabAsync").ToList(), _ => true);
+
+        // ...and it names the ROW's tab. A count-only pin survives the
+        // argument being swapped for the active tab: the chord would close
+        // whichever tab is active, dialog and all, with every guard green.
+        Assert.Equal(
+            "tab",
+            rowAction.CallEndingWith("RequestCloseTabAsync").ArgExpression(0).ToString());
+
+        // No second policy: no direct manager close, no surface write.
+        Assert.Empty(rowAction.Calls("CloseTab"));
+        Assert.Empty(rowAction.CallsEndingWith("SurfaceBindingAction").ToList());
+
+        // Mode-exact, and BOTH spellings: the bare tag is the defensive arm
+        // for a serialization that stops writing the default mode; a prefix
+        // match would also catch close_tab:other and close_tab:right, which
+        // sweep relative to the ACTIVE tab and have no answer at a row.
+        Assert.Contains(
+            rowAction.DescendantNodes().OfType<LiteralExpressionSyntax>(),
+            l => l.ToString() == "\"close_tab\"");
+        Assert.Contains(
+            rowAction.DescendantNodes().OfType<LiteralExpressionSyntax>(),
+            l => l.ToString() == "\"close_tab:this\"");
+        Assert.DoesNotContain(
+            rowAction.DescendantNodes().OfType<InvocationExpressionSyntax>(),
+            i => i.CalleeText().EndsWith("StartsWith", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// One caller: the row-targeted dispatch is reachable only through the
+    /// frame router's claim. A second entry would close a tab without the
+    /// focus context the claim is the whole point of.
+    /// </summary>
+    [Fact]
+    public void TheRowTargetedDispatch_HasExactlyOneCaller()
+    {
+        var hits = ShellSource.AllFiles()
+            .SelectMany(s => s.Root.CallsEndingWith("TryExecuteTabRowAction")
+                .Select(c => (
+                    Tail: s.Name,
+                    Method: c.Ancestors().OfType<MethodDeclarationSyntax>()
+                        .FirstOrDefault()?.Identifier.ValueText ?? "?")))
+            .ToList();
+        Assert.True(
+            hits.Count == 1,
+            "TryExecuteTabRowAction must have exactly one caller (the frame "
+                + "router's claim in TryDispatchFrameChord); found " + hits.Count
+                + ": " + string.Join(", ", hits.Select(h => h.Tail + ":" + h.Method)));
+        Assert.Equal("TryDispatchFrameChord", hits[0].Method);
+    }
+
+    /// <summary>
+    /// The router must not learn what a row looks like in either strip: the
+    /// answer lives behind ITabHost, one member, implemented by both hosts,
+    /// so a third layout cannot forget it.
+    /// </summary>
+    [Fact]
+    public void BothHosts_AnswerTheFocusedRow_BehindTheSharedInterface()
+    {
+        var itab = ShellSource.Load("Tabs.ITabHost.cs").Root;
+        Assert.Contains(
+            itab.DescendantNodes().OfType<MethodDeclarationSyntax>(),
+            m => m.Identifier.ValueText == "TabFromElement");
+
+        var vertical = ShellSource.Load("Tabs.VerticalTabHost.xaml.cs")
+            .Method("TabFromElement");
+        Assert.Single(vertical.CallsEndingWith("TabFromElement").ToList(), _ => true);
+
+        var horizontal = ShellSource.Load("Tabs.TabHost.xaml.cs")
+            .Method("TabFromElement");
+        Assert.Single(
+            horizontal.DescendantNodes().OfType<GenericNameSyntax>()
+                .Where(g => g.Identifier.ValueText == "FindAncestor")
+                .Where(g => g.TypeArgumentList.ToString().Trim('<', '>') == "TabViewItem")
+                .ToList(),
+            _ => true);
+
+        // ...and the DATA side, which is where a silent null would come
+        // from: the horizontal row answers only because the tab-item build
+        // assigns the tab to Tag. The item is identified as the one creation
+        // that binds a DataContext (the group chips carry their group on Tag
+        // and bind nothing), and that initializer has to carry the Tag too:
+        // a row without it answers null, which quietly falls the chord back
+        // to the active pane -- the planted bug on the default layout.
+        var tabHost = ShellSource.Load("Tabs.TabHost.xaml.cs");
+        var item = Assert.Single(
+            tabHost.Root.DescendantNodes().OfType<ObjectCreationExpressionSyntax>()
+                .Where(o => o.Type.ToString() == "TabViewItem")
+                .Where(o => o.Initializer?.Expressions.OfType<AssignmentExpressionSyntax>()
+                    .Any(a => a.Left.ToString() == "DataContext") == true)
+                .ToList(),
+            _ => true);
+        var tagAssign = item.Initializer!.Expressions
+            .OfType<AssignmentExpressionSyntax>()
+            .FirstOrDefault(a => a.Left.ToString() == "Tag");
+        Assert.True(
+            tagAssign is not null && tagAssign.Right.ToString() == "tab",
+            "the horizontal tab item must carry its TabModel on Tag: the chord "
+                + "router resolves a focused row through TabFromElement, and a "
+                + "row without Tag answers null, which quietly falls the chord "
+                + "back to the active pane");
     }
 }
