@@ -15,6 +15,7 @@ const Selection = @import("Selection.zig");
 const Screen = @import("Screen.zig");
 const ScreenSet = @import("ScreenSet.zig");
 const Style = @import("style.zig").Style;
+const stylepkg = @import("style.zig");
 const Terminal = @import("Terminal.zig");
 
 // Developer note: this is in src/terminal and not src/renderer because
@@ -716,7 +717,12 @@ pub const RenderState = struct {
                 if (cy < chunk.start or cy >= chunk.start + take) break :cursor;
                 self.cursor.viewport = .{
                     .y = @intCast(y + (cy - chunk.start)),
-                    .x = s.cursor.x,
+
+                    // When the stream leaves the cursor in a run of
+                    // prompt-owned trailing blanks, the rendered caret
+                    // clamps onto the first of them so it sits flush with
+                    // the last visible glyph (see promptCaretClamp).
+                    .x = promptCaretClamp(t, s) orelse s.cursor.x,
 
                     // Future: we should use our own state here to look this
                     // up rather than calling this.
@@ -725,6 +731,13 @@ pub const RenderState = struct {
                     else
                         false,
                 };
+
+                // The clamp target is never a wide-cell tail (the scan
+                // treats tails as occupied), so a clamped caret is never
+                // on a tail.
+                if (self.cursor.viewport.?.x != s.cursor.x) {
+                    self.cursor.viewport.?.wide_tail = false;
+                }
             }
 
             // The page-level dirty flag applies to every row in the chunk.
@@ -1294,6 +1307,117 @@ pub const RenderState = struct {
 /// dirty rows or special cells. Rows and cells are small packed structs
 /// so a group is scanned with a handful of vector operations.
 const scan_group_len = 8;
+
+/// Returns the column the rendered caret should clamp to when the parsed
+/// grid cursor rests in a run of prompt-owned trailing blanks, else null.
+///
+/// Shells that mark the prompt boundary (OSC 133) write their own trailing
+/// blank as part of the prompt (themes commonly end in "glyph "), so the
+/// parsed grid cursor comes to rest one or more cells past the last
+/// visible glyph. A caret drawn at the parsed cursor then floats a blank
+/// cell right of the prompt text. The accessibility layer already clamps
+/// its caret to the trimmed line; this applies the same rule to the
+/// rendered caret origin.
+///
+/// Every cursor style (block, bar, underline, and the unfocused hollow
+/// box) is drawn from this single caret origin, so the clamp applies
+/// uniformly to all of them, matching the accessibility clamp, which is
+/// also style-independent.
+///
+/// The clamp is gated hard so nothing else moves:
+///   - The cursor's live semantic state must be input (after 133;B).
+///     Integrations that never emit B (fish, elvish) and themes that
+///     re-mark later lose the clamp and keep the pre-fix caret, and
+///     stale prompt rows revisited after the command started are
+///     ordinary output cursors. Trade: without a B on the row we cannot
+///     tell typed input from prompt blanks, so we do not clamp at all.
+///   - Blank cells in the run must carry the prompt semantic (OSC
+///     133;A). Blanks the shell wrote as user input after B, or plain
+///     output blanks, never clamp, so typed spaces still follow the
+///     cursor and shell-less prompts are unchanged.
+///   - Pending wrap (cursor on the last column awaiting wrap) is a real
+///     past-the-end position and never clamps.
+///   - Explicit cursor positioning is untouched except where it is
+///     inherently indistinguishable from the idle prompt: a position at
+///     or inside the prompt's own trailing blank run is exactly the
+///     shape the clamp exists for, so it clamps too.
+///
+/// Trust boundary: the clamp trusts the OSC 133 boundary contract. A
+/// stream that lies about A/B mislabels its own blanks and gets the
+/// unclamped caret, exactly as every other semantic consumer already
+/// allows.
+///
+/// The scan is bounded by the cursor column and stops at the first
+/// occupied cell (normally the prompt text right next to the blank).
+fn promptCaretClamp(
+    t: *Terminal,
+    s: *Screen,
+) ?size.CellCountInt {
+    // Prompts are a primary-screen idea.
+    if (t.screens.active_key == .alternate) return null;
+
+    // Pending wrap: the cursor is a real past-the-end position.
+    if (s.cursor.pending_wrap) return null;
+
+    // Only the idle input boundary clamps: the shell must have ended the
+    // prompt with 133;B. Without this, integrations that never emit B
+    // (typed input is then stamped with the prompt semantic) and programs
+    // revisiting stale prompt rows after the command started would clamp
+    // on every keystroke.
+    if (s.cursor.semantic_content != .input) return null;
+
+    // Fast exit for terminals that never saw shell integration.
+    if (!s.semantic_prompt.seen) return null;
+
+    const x: usize = s.cursor.x;
+    if (x == 0) return null;
+
+    // The cells of the cursor row left of the cursor. A row's cells are
+    // contiguous (Screen.cursorCellLeft relies on the same property).
+    const base: [*]const page.Cell = @ptrCast(s.cursor.page_cell);
+    const cells = (base - x)[0..x];
+
+    // Walk right to left: every cell must be a blank prompt cell until we
+    // hit something occupied; the caret clamps to the first blank after
+    // it. If we walk off column zero the whole prefix is prompt blank and
+    // the caret clamps to zero.
+    var i: usize = x;
+    while (i > 0) {
+        i -= 1;
+        const cell = &cells[i];
+
+        // Occupied: any visible content (glyph, grapheme) or part of a
+        // wide cluster. A blank counts as occupied when it paints
+        // anything: a background (colored block), inverse video, or a
+        // decoration (underline/overline/strikethrough), mirroring what
+        // resolveCell and the draw loop paint; a foreground-only styled
+        // blank renders as nothing and stays clappable, which is what
+        // real themes emit. Hyperlinks are ignored: their paint depends
+        // on a renderer config this seam cannot see.
+        var blank = cell.wide == .narrow and switch (cell.content_tag) {
+            .codepoint => cp: {
+                const cp = cell.content.codepoint.data;
+                break :cp cp == 0 or cp == ' ';
+            },
+            .codepoint_grapheme, .bg_color_palette, .bg_color_rgb => false,
+        };
+        if (blank and cell.style_id != stylepkg.default_id) {
+            const p = s.cursor.page_pin.node.page();
+            const st = p.styles.get(p.memory, cell.style_id);
+            blank = st.bg_color == .none and
+                !st.flags.inverse and
+                st.flags.underline == .none and
+                !st.flags.overline and
+                !st.flags.strikethrough;
+        }
+        if (!blank) return if (i + 1 == x) null else @intCast(i + 1);
+
+        // Blank but not owned by the prompt: user input or output, so
+        // the run is not the prompt's trailing blank.
+        if (cell.semantic_content != .prompt) return null;
+    }
+    return 0;
+}
 
 /// Group scan helper for the row dirty flag. A row that matches has
 /// its dirty flag unset.
@@ -2207,6 +2331,396 @@ test "cursor state out of viewport" {
     try testing.expectEqual(0, state.cursor.active.x);
     try testing.expectEqual(1, state.cursor.active.y);
     try testing.expect(state.cursor.viewport == null);
+}
+
+// A shell integration-marked prompt (OSC 133;A) whose theme ends in its own
+// trailing blank ("glyph "), then input start (OSC 133;B). The parsed grid
+// cursor rests past the blank; the rendered caret must clamp onto it.
+const prompt_trailing_blank_stream =
+    "\x1b]133;A\x07" ++ // prompt start
+    "home" ++
+    "\r\n" ++
+    "\u{2570}\u{2500}\u{EA85}\u{EAB6} " ++ // glyphs + the prompt's blank
+    "\x1b]133;B\x07"; // input starts
+
+test "block caret clamps onto a prompt-owned trailing blank" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice(prompt_trailing_blank_stream);
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // The grid cursor is where the stream left it: one past the blank.
+    try testing.expectEqual(5, state.cursor.active.x);
+    // The rendered caret clamps onto the prompt's blank, flush with the
+    // last glyph.
+    try testing.expectEqual(4, state.cursor.viewport.?.x);
+}
+
+test "block caret follows typed input past a prompt trailing blank" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice(prompt_trailing_blank_stream);
+
+    // The user types a space in the input area: semantically input, so the
+    // caret must follow the cursor and not clamp back to the prompt text.
+    s.nextSlice(" ");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(6, state.cursor.active.x);
+    try testing.expectEqual(6, state.cursor.viewport.?.x);
+}
+
+test "block caret does not clamp on pending wrap" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 10,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    // A prompt whose trailing blanks run to the end of the row: the print
+    // leaves the cursor on the last column awaiting wrap. That is a real
+    // past-the-end position and must not clamp.
+    s.nextSlice("\x1b]133;A\x07");
+    s.nextSlice("ab        ");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expect(t.screens.active.cursor.pending_wrap);
+    try testing.expectEqual(9, state.cursor.active.x);
+    try testing.expectEqual(9, state.cursor.viewport.?.x);
+}
+
+test "block caret does not clamp after explicit cursor positioning" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice(prompt_trailing_blank_stream);
+    // CUP into the unwritten area of the prompt row: the blanks there are
+    // not prompt cells, so the caret stays where the stream put it.
+    s.nextSlice("\x1b[2;8H");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(7, state.cursor.active.x);
+    try testing.expectEqual(7, state.cursor.viewport.?.x);
+
+    // CUP exactly onto the prompt's own blank: the caret is already flush,
+    // so this is unchanged too.
+    var t2 = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t2.deinit(alloc);
+
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(prompt_trailing_blank_stream);
+    s2.nextSlice("\x1b[2;5H");
+
+    var state2: RenderState = .empty;
+    defer state2.deinit(alloc);
+    try state2.update(alloc, &t2);
+
+    try testing.expectEqual(4, state2.cursor.active.x);
+    try testing.expectEqual(4, state2.cursor.viewport.?.x);
+}
+
+test "block caret does not clamp without shell integration" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // The same trailing shape with no OSC 133: the trailing blank cannot be
+    // attributed to the prompt, so the caret follows the grid cursor.
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("home\r\n");
+    s.nextSlice("\u{2570}\u{2500}\u{EA85}\u{EAB6} ");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(5, state.cursor.active.x);
+    try testing.expectEqual(5, state.cursor.viewport.?.x);
+}
+
+test "block caret does not clamp a stale prompt row after command start" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Once the command starts (133;C) the row is stale: a program redrawing
+    // over the old prompt row and parking the cursor in the old trailing
+    // blank region is an ordinary output cursor and must not clamp.
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice(prompt_trailing_blank_stream);
+    s.nextSlice("\x1b]133;C\x07"); // input ends, output starts
+    s.nextSlice("\x1b[2;6H"); // a redraw revisits the old prompt row
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(5, state.cursor.active.x);
+    try testing.expectEqual(5, state.cursor.viewport.?.x);
+}
+
+test "block caret follows typed input when integration never emits B" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // fish/elvish-style integration emits 133;A but never 133;B, so typed
+    // input is stamped with the prompt semantic and only the cursor's live
+    // state can keep the caret on it.
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b]133;A\x07");
+    s.nextSlice("\u{2570}\u{2500}\u{EA85}\u{EAB6} "); // prompt incl its blank
+    s.nextSlice("  "); // typed without any B: stamped prompt too
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(7, state.cursor.active.x);
+    try testing.expectEqual(7, state.cursor.viewport.?.x);
+}
+
+test "block caret clamps past a wide glyph at the prompt boundary" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b]133;A\x07");
+    s.nextSlice("世界 "); // wide glyphs then the prompt's blank
+    s.nextSlice("\x1b]133;B\x07");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(5, state.cursor.active.x);
+    // The caret lands on the blank column, never on a wide spacer tail.
+    try testing.expectEqual(4, state.cursor.viewport.?.x);
+    try testing.expect(!state.cursor.viewport.?.wide_tail);
+}
+
+test "block caret clamps to the first of several prompt blanks" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b]133;A\x07");
+    s.nextSlice("ab  "); // two trailing prompt blanks
+    s.nextSlice("\x1b]133;B\x07");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(4, state.cursor.active.x);
+    try testing.expectEqual(2, state.cursor.viewport.?.x);
+}
+
+test "erase inside the run releases the clamp" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice(prompt_trailing_blank_stream);
+    // Erase the prompt's blank: the cell is rewritten out of the prompt
+    // semantic, breaking the run.
+    s.nextSlice("\x1b[2;5H");
+    s.nextSlice("\x1b[X");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // The cursor sits on the erased cell, so the caret is there either way.
+    try testing.expectEqual(4, state.cursor.active.x);
+    try testing.expectEqual(4, state.cursor.viewport.?.x);
+
+    // A redraw that parks the cursor past the broken run no longer clamps.
+    s.nextSlice("\x1b[2;6H");
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(5, state.cursor.active.x);
+    try testing.expectEqual(5, state.cursor.viewport.?.x);
+}
+
+test "block caret clamps onto a foreground-styled prompt blank" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // The real atomic theme writes its trailing blank INSIDE the colored
+    // segment: the blank carries a foreground style but no background, so
+    // it renders as nothing and is still a blank to the scan.
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b]133;A\x07");
+    s.nextSlice("\x1b[38;2;224;248;255m\u{2570}\u{2500}\u{EA85}\u{EAB6} \x1b[0m");
+    s.nextSlice("\x1b]133;B\x07");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(5, state.cursor.active.x);
+    try testing.expectEqual(4, state.cursor.viewport.?.x);
+}
+
+test "block caret does not clamp onto a background-colored prompt blank" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // A blank with a background color is a visible cell: colored blanks
+    // count as occupied and the caret stays at the cursor. Pinned behavior.
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b]133;A\x07");
+    s.nextSlice("ab");
+    s.nextSlice("\x1b[48;5;1m \x1b[0m"); // blank cell with a background color
+    s.nextSlice("\x1b]133;B\x07");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(3, state.cursor.active.x);
+    try testing.expectEqual(3, state.cursor.viewport.?.x);
+}
+
+test "block caret does not clamp onto a reverse-video prompt blank" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    const io = testing.io;
+
+    // Inverse video paints the blank fully opaque (fg/bg swap), so it is
+    // a visible cell and the caret stays at the cursor.
+    var t = try Terminal.init(io, alloc, .{
+        .cols = 20,
+        .rows = 5,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    s.nextSlice("\x1b]133;A\x07");
+    s.nextSlice("ab");
+    s.nextSlice("\x1b[7m \x1b[0m"); // reverse-video blank cell
+    s.nextSlice("\x1b]133;B\x07");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    try testing.expectEqual(3, state.cursor.active.x);
+    try testing.expectEqual(3, state.cursor.viewport.?.x);
 }
 
 test "dirty state" {
