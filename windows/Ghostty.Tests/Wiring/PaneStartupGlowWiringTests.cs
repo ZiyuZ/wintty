@@ -148,14 +148,11 @@ public class PaneStartupGlowWiringTests
             .Single(m => m.Identifier.ValueText == "CloseLeaf"
                          && m.ParameterList.Parameters.Count == 2);
 
-        var softClose = close.DescendantNodes().OfType<IfStatementSyntax>()
-            .Single(i => i.Condition.ToString() == "softClose");
+        // The retained-shell branch is the `if (softClose)` after PaneTree.Close: the early
+        // one captures the undo snapshot ahead of the model close (pinned by
+        // PaneCloseUndoSnapshotWiringTests).
+        var softClose = PaneFadeWiringTests.SoftBranchAfterModelClose(close);
         var retained = Assert.IsType<BlockSyntax>(softClose.Statement);
-
-        // The undo snapshot stays in the branch; the glow close is added to
-        // it, not swapped for it.
-        Assert.Contains(retained.DescendantNodesAndSelf().OfType<InvocationExpressionSyntax>(),
-            i => i.CalleeText() == "CaptureForUndo");
 
         var closed = Assert.Single(retained.DescendantNodes()
             .OfType<InvocationExpressionSyntax>(),
