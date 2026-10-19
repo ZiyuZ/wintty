@@ -304,15 +304,15 @@ public class ConfigWatcherWiringTests
     }
 
     /// <summary>
-    /// A shrink that outlives the floor is a deletion of a layered file
-    /// the watcher does not watch, and believing the disk is the only way
-    /// the session recovers: no event is coming for that file, so a
-    /// refusal here is permanent. The config in hand was built from every
-    /// file that does exist, so applying it is the user's configuration as
-    /// it now stands.
+    /// The two carries are logged apart and neither writes the count. A
+    /// shrink that outlives the floor is a deletion of a layered file the
+    /// watcher does not watch, and believing the disk is the only way the
+    /// session recovers: no event is coming for that file, so a refusal
+    /// would be permanent. The user's ask is the other carry. Both apply
+    /// through the one applied path, which is what records the count.
     /// </summary>
     [Fact]
-    public void A_shrink_that_outlives_the_floor_is_applied_as_a_deletion()
+    public void The_two_carries_are_logged_apart_and_write_no_count()
     {
         var (_, guard) = ReloadGuard();
 
@@ -323,32 +323,20 @@ public class ConfigWatcherWiringTests
         Assert.Equal("shrinkElapsed", heal.Arg(3));
         Assert.Equal("ConfigVanishConfirmer.DefaultFloor", heal.Arg(4));
 
-        // The decline's cost only runs when neither proof landed: not a
-        // confirmed vanish of the watched file, and not a shrink that
-        // outlived the floor. Both operands are decomposed rather than
-        // matched as text, because a condition that merely CONTAINS the
-        // heal is also satisfied by one that inverts it.
-        var inner = heal.Ancestors().OfType<IfStatementSyntax>().First();
-        var both = Assert.IsType<BinaryExpressionSyntax>(inner.Condition);
-        Assert.Equal(SyntaxKind.LogicalAndExpression, both.Kind());
-
-        var vanish = Assert.IsType<PrefixUnaryExpressionSyntax>(both.Left);
-        Assert.Equal(SyntaxKind.ExclamationToken, vanish.OperatorToken.Kind());
-        Assert.Equal("vanishConfirmed", vanish.Operand.ToString());
-
-        var not = Assert.IsType<PrefixUnaryExpressionSyntax>(both.Right);
-        Assert.Equal(SyntaxKind.ExclamationToken, not.OperatorToken.Kind());
-        Assert.Equal(heal.Span, not.Operand.Span);
-        Assert.NotEmpty(inner.Statement.Calls("NativeMethods.ConfigFree"));
-        Assert.Contains(
-            inner.Statement.DescendantNodes().OfType<ReturnStatementSyntax>(),
-            r => r.Expression?.ToString() == "false");
-
-        // The heal writes the count nowhere: the applied path below
-        // records the lower count, so the fall-through stays inside the
-        // one-writer rule. All it adds is the account of what happened.
-        Assert.NotEmpty(guard.Statement.Calls(
+        // Each carry gets its own account, branched on the shrink local the
+        // carry condition read: a log that named neither would show a run
+        // of declines ending in an unexplained apply.
+        var carried = Assert.Single(guard.Statement.DescendantNodes()
+            .OfType<IfStatementSyntax>()
+            .Where(i => i.Condition.ToString() == "persistentShrink"));
+        Assert.NotEmpty(carried.Statement.Calls(
             "StaticLoggers.ConfigService.LogReloadDefaultFilesShrunk"));
+        Assert.NotEmpty(carried.Else!.Statement.Calls(
+            "StaticLoggers.ConfigService.LogReloadAppliedDefaultsRequest"));
+
+        // And the carry writes the count nowhere: the applied path below
+        // records what the load found, so the fall-through stays inside
+        // the one-writer rule.
         Assert.Empty(guard.Statement.Calls("RecordDefaultFiles"));
     }
 
@@ -450,8 +438,12 @@ public class ConfigWatcherWiringTests
     [Fact]
     public void Lifting_the_write_suppression_frees_both_ask_budgets()
     {
+        // Anchored on the bracket's own polarity: the lift now also holds a
+        // File.Exists guard for the machine's resync, pinned on its own in
+        // A_lifted_write_bracket_resolves_the_machine_on_live_evidence.
         var guard = Assert.Single(ConfigService().Method("SuppressWatcher")
-            .DescendantNodes().OfType<IfStatementSyntax>());
+            .DescendantNodes().OfType<IfStatementSyntax>()
+            .Where(i => i.Condition.ToString() == "!suppress"));
 
         Assert.Equal("!suppress", guard.Condition.ToString());
 
@@ -537,16 +529,19 @@ public class ConfigWatcherWiringTests
 
     /// <summary>
     /// A config file that stays gone is reported by the watcher, and the
-    /// session stops claiming to be running on one.
+    /// handler that hears about the eventless absences still does the one
+    /// thing it can: reload, and let the load's verdict answer.
     /// </summary>
     /// <remarks>
-    /// Without this the refusal is permanent: the count only ever rose, so a
-    /// session whose config file is deleted declines every later reload for
-    /// the life of the process, and High Contrast reaches the terminal only
-    /// through the config a reload builds.
+    /// Since the event machine (wintty#1158) a SEEN delete never reaches
+    /// this handler; what reaches it is the absence no event ever named: a
+    /// save straddling the delivery hop, a lost event, a deleted directory.
+    /// On those paths the verdict is still the only evidence there is, and
+    /// without the reload the session would refuse every later reload for
+    /// the life of the process (#676).
     /// </remarks>
     [Fact]
-    public void A_vanished_config_file_is_reported_and_clears_the_session_count()
+    public void A_vanished_config_file_is_reported_and_the_handler_reloads()
     {
         var source = ConfigService();
 
@@ -564,7 +559,8 @@ public class ConfigWatcherWiringTests
         Assert.Single(vanished.Calls("Reload"));
 
         // And the handler keeps nothing of its own: no count, no push. The
-        // count falls on the applied path, through its one writer.
+        // count falls on the applied path, through its one writer, and a
+        // concluded deletion moves nothing but the notice.
         Assert.Empty(vanished.Calls("RecordDefaultFiles"));
         Assert.Empty(vanished.Calls("NativeMethods.AppUpdateConfig"));
 
@@ -576,7 +572,7 @@ public class ConfigWatcherWiringTests
 
     /// <summary>
     /// And it asks before it believes. One vanished report is what an
-    /// ordinary atomic save produces, so the count moves only on the far
+    /// ordinary atomic save produces, so the notice moves only on the far
     /// side of a confirmation, never on the report itself.
     /// </summary>
     /// <remarks>
@@ -585,17 +581,20 @@ public class ConfigWatcherWiringTests
     /// assertion here is over source read with Roslyn, and source ORDER is
     /// not control flow. The decision, the asks and the accept live behind
     /// <c>ConfigVanishProtocol</c> exactly because a test of this kind
-    /// could not see them set wrong: a budget of zero restores the defect
-    /// and passes everything here. <c>ConfigVanishProtocolTests</c> drives
-    /// the wiring against a real watcher. This only says the handler
-    /// delegates to it and that nothing beside the delegation acts.</para>
+    /// could not see them set wrong. <c>ConfigVanishProtocolTests</c> and
+    /// <c>ConfigWatcherEventShapeTests</c> drive the wiring against a real
+    /// watcher. This only says the handler delegates to it and that nothing
+    /// beside the delegation acts.</para>
     ///
-    /// <para>The proof that the report fires mid save is
-    /// <c>ConfigFileWatcherTests.The_file_check_runs_in_the_delivery_not_on_the_timer</c>
-    /// (issue #1146).</para>
+    /// <para>What an accept causes is the notice and nothing else: the
+    /// shipped accept was also the key that carried an absence past the
+    /// gate and applied a defaults config, which is the silent reset
+    /// wintty#1158 removed. The pin that used to sit here guarding the
+    /// CARRY is now the one guarding its absence, in
+    /// <see cref="Absence_carries_nothing_past_the_gate"/>.</para>
     /// </remarks>
     [Fact]
-    public void A_vanished_config_file_is_confirmed_before_the_count_moves()
+    public void A_vanished_config_file_is_confirmed_before_the_notice_moves()
     {
         var source = ConfigService();
 
@@ -611,13 +610,57 @@ public class ConfigWatcherWiringTests
         Assert.Empty(source.Method("OnConfigFileVanished")
             .Calls("_vanishProtocol.Observed"));
 
-        // The accept's only effect is the account of it. The count moves on
-        // the applied path, which a proven vanish reaches by being carried
-        // past the gate, not by the accept reaching over and writing it.
-        var onAccept = ProtocolArgument("onAccept");
-        Assert.NotEmpty(onAccept.Calls(
+        // The accept's effects are the account of it and the notice, in
+        // one named handler the census can read. The count moves on the
+        // applied path alone, and never because a file went missing.
+        Assert.Equal("OnVanishAccepted", ProtocolArgument("onAccept").Expression.ToString());
+        var accepted = source.Method("OnVanishAccepted");
+        Assert.NotEmpty(accepted.Calls(
             "StaticLoggers.ConfigService.LogConfigFileVanished"));
-        Assert.Empty(onAccept.Calls("RecordDefaultFiles"));
+        Assert.NotEmpty(accepted.Calls("_missingNoticeSource.OnDeletionConfirmed"));
+        Assert.Empty(accepted.Calls("RecordDefaultFiles"));
+        Assert.Empty(accepted.Calls("NativeMethods.AppUpdateConfig"));
+    }
+
+    /// <summary>
+    /// Absence carries nothing past the gate. The carry takes a shrink that
+    /// outlived the floor, or the user's own load-defaults ask, and the
+    /// vanish answer is neither: a concluded deletion ends in the notice
+    /// and the settings the session already has.
+    /// </summary>
+    /// <remarks>
+    /// The shipped shape handed <c>vanishConfirmed</c> to this guard as a
+    /// third key, and that key was the defect: a save whose gap outlived
+    /// the dwell proved its own "deletion" and was applied as an empty
+    /// config over the user's settings. No variable of that name may come
+    /// back; the two-key rule itself is
+    /// <c>ConfigReloadGate.CarriesPastGate</c>, and the reload must ask IT
+    /// rather than grow a second copy of the disjunction.
+    /// </remarks>
+    [Fact]
+    public void Absence_carries_nothing_past_the_gate()
+    {
+        var source = ConfigService();
+        var reload = source.Method("Reload");
+
+        var carry = Assert.Single(reload.Calls("ConfigReloadGate.CarriesPastGate"));
+        Assert.Equal("persistentShrink", carry.Arg(0));
+        Assert.Equal("loadDefaultsRequested", carry.Arg(1));
+
+        // The two keys are computed, not re-derived at the call: the shrink
+        // keeps its own name so the decline's log can tell the two carries
+        // apart, and the ask is the one-shot read at the top of the method.
+        var shrink = Assert.Single(reload.Calls("ConfigReloadGate.IsPersistentShrink"));
+        Assert.Equal("persistentShrink", shrink.Ancestors()
+            .OfType<VariableDeclarationSyntax>().First()
+            .Variables[0].Identifier.ValueText);
+
+        // And no verdict-shaped variable unlocks anything: the vanish
+        // answer reaches the protocol and stops there.
+        Assert.DoesNotContain(reload.DescendantNodes()
+            .OfType<VariableDeclarationSyntax>()
+            .Where(v => v.Type.ToString() == "bool"),
+            v => v.Variables.Any(x => x.Identifier.ValueText.Contains("vanish", StringComparison.OrdinalIgnoreCase)));
     }
 
     /// <summary>
@@ -933,15 +976,35 @@ public class ConfigWatcherWiringTests
         var observed = Assert.Single(ConfigService().Method("Reload")
             .Calls("_vanishProtocol.Observed"));
 
-        // The gate's own agreement check, short-circuited in front of the
-        // call, with this load's verdict and count. Decomposed rather than
-        // matched as text, because a substring assertion here would accept
-        // the check sitting beside the call instead of guarding it.
-        var and = Assert.IsType<BinaryExpressionSyntax>(observed.Parent);
-        Assert.Equal(SyntaxKind.LogicalAndExpression, and.Kind());
-        Assert.Equal(observed.Span, and.Right.Span);
+        // The gate's own agreement check, short-circuiting in front of the
+        // call in the same && chain, with this load's verdict and count.
+        // The chain is flattened into its operand NODES rather than matched
+        // as text, because a substring assertion here would accept the
+        // check sitting beside the call instead of guarding it. The
+        // machine's no-better-answer conjunct lives in the same chain
+        // (pinned beside this test) and is deliberately not this guard.
+        var operands = new List<ExpressionSyntax>();
+        void Collect(ExpressionSyntax e)
+        {
+            if (e is BinaryExpressionSyntax b && b.Kind() == SyntaxKind.LogicalAndExpression)
+            {
+                Collect(b.Left);
+                Collect(b.Right);
+            }
+            else
+            {
+                operands.Add(e);
+            }
+        }
+        Collect((BinaryExpressionSyntax)observed.Parent!);
 
-        var agree = Assert.IsType<InvocationExpressionSyntax>(and.Left);
+        // The call is the chain's last operand, and the agreement check is
+        // its FIRST guard, ahead of the machine's conjunct in
+        // short-circuit order.
+        Assert.True(operands.Count >= 3, "the call is guarded by nothing");
+        Assert.True(operands[^1].Span == observed.Span,
+            "the Observed call is not the chain's final operand");
+        var agree = Assert.IsType<InvocationExpressionSyntax>(operands[0]);
         Assert.Equal("ConfigReloadGate.VerdictAndCountAgree", agree.Expression.ToString());
         Assert.Equal("defaultFiles", agree.ArgumentList.Arguments[0].ToString());
         Assert.Equal("defaultFilesFound", agree.ArgumentList.Arguments[1].ToString());
@@ -1093,5 +1156,243 @@ public class ConfigWatcherWiringTests
         // Born null, never born old.
         var (variable, _) = service.Field("_shrinkSince");
         Assert.Null(variable.Initializer);
+    }
+
+    /// <summary>
+    /// The watcher is built with the event machine: the field the
+    /// constructor created, so the watcher's deliveries and the notice
+    /// source see one machine, and no second one can grow beside it.
+    /// </summary>
+    [Fact]
+    public void StartWatcher_hands_the_watcher_the_event_machine()
+    {
+        var creation = Creations(ConfigService().Method("StartWatcher"))
+            .Single(o => o.Type.ToString() == "ConfigFileWatcher");
+
+        // Positional, in the logger slot the old signature ended at: a
+        // watcher built without a machine is the shipped defect, so the
+        // argument's PRESENCE is the pin.
+        Assert.Contains(
+            creation.ArgumentList!.Arguments,
+            a => a.Expression.ToString() == "_presence");
+
+        // One machine, built where the notice source can subscribe to it.
+        var source = ConfigService();
+        Assert.Single(Creations(source.Root), o => o.Type.ToString() == "ConfigFilePresence");
+        Assert.Single(Creations(source.Root), o => o.Type.ToString() == "ConfigFileMissingNoticeSource");
+    }
+
+    /// <summary>
+    /// The load-defaults ask is set once, by the notice's action, and
+    /// spent by the one reload it asked for. A second setter is a second
+    /// instruction nobody gave; a setter anywhere else dilutes the only
+    /// key an absence can ever be carried by.
+    /// </summary>
+    [Fact]
+    public void The_load_defaults_ask_is_set_once_spent_once()
+    {
+        var source = ConfigService();
+
+        var writes = source.Root.AssignsTo("_loadDefaultsPending").ToList();
+        Assert.Equal(2, writes.Count);
+
+        var set = Assert.Single(writes, w => w.Right.ToString() == "true");
+        Assert.Equal("OnLoadDefaultsRequested",
+            set.Ancestors().OfType<MethodDeclarationSyntax>().First()
+                .Identifier.ValueText);
+
+        // The ask rides a reload the asker called for, not one that
+        // happens to come by.
+        var asked = source.Method("OnLoadDefaultsRequested");
+        Assert.Single(asked.Calls("Reload"));
+
+        var spent = Assert.Single(writes, w => w.Right.ToString() == "false");
+        Assert.Equal("Reload",
+            spent.Ancestors().OfType<MethodDeclarationSyntax>().First()
+                .Identifier.ValueText);
+
+        // Read-and-clear sits before the build: a decline cannot bank the
+        // ask for a later unrelated decline, and a click cannot apply
+        // twice. The local it feeds is the one the carry condition reads.
+        var reload = ConfigService().Method("Reload");
+        var build = Assert.Single(reload.Calls("BuildLiveConfig"));
+        Assert.True(spent.Span.End < build.SpanStart,
+            "the ask was consumed after the config was built");
+        var carry = Assert.Single(reload.Calls("ConfigReloadGate.CarriesPastGate"));
+        Assert.Equal("loadDefaultsRequested", carry.Arg(1));
+    }
+
+    /// <summary>
+    /// Teardown stops the backstop poll beside the watcher and the
+    /// look-again: a poll firing into teardown is fenced by the shutdown
+    /// flag, and this is the plan rather than the fence.
+    /// </summary>
+    [Fact]
+    public void BeginShutdown_cancels_the_backstop_poll_and_dispose_frees_it()
+    {
+        var source = ConfigService();
+
+        Assert.NotEmpty(source.Method("BeginShutdown").Calls("_backstopTimer.Cancel"));
+        Assert.NotEmpty(source.Method("Dispose").Calls("_backstopTimer.Dispose"));
+    }
+
+    /// <summary>
+    /// The notice reaches the app's queue through the sink App installs
+    /// once both services exist: the config service is constructed first,
+    /// so the source reads the queue at show time rather than taking one
+    /// in its constructor.
+    /// </summary>
+    [Fact]
+    public void The_missing_config_notice_reaches_the_app_queue_through_a_sink()
+    {
+        var app = ShellSource.Load("App.xaml.cs");
+
+        var set = Assert.Single(app.Root.Calls("_configService.SetNoticeSink"));
+
+        // After the queue is CONSTRUCTED, or the first show would find null
+        // and skip: the sink is read at show time, but the setting up of it
+        // still has to happen. Anchored on the construction rather than the
+        // field's assignments, because the field is also nulled at
+        // teardown.
+        var built = Assert.Single(Creations(app.Root), c =>
+            c.Type.ToString().EndsWith("Notifications.NotificationService",
+                StringComparison.Ordinal));
+        Assert.True(built.Span.End < set.SpanStart,
+            "the notice sink was installed before the notice queue was built");
+    }
+
+    /// <summary>
+    /// A lift of the write bracket is live evidence: the service's own
+    /// writes raise no kinds, so a file recreated inside the bracket is
+    /// invisible to the machine until the lift checks the disk. One check,
+    /// resolving the machine when the file is there.
+    /// </summary>
+    [Fact]
+    public void A_lifted_write_bracket_resolves_the_machine_on_live_evidence()
+    {
+        var lift = Assert.Single(ConfigService().Method("SuppressWatcher")
+            .DescendantNodes().OfType<IfStatementSyntax>()
+            .Where(i => i.Condition.ToString() == "!suppress"));
+
+        var see = Assert.Single(lift.Statement.Calls("_presence.SeePresent"));
+        var guard = Assert.IsType<IfStatementSyntax>(see.Ancestors()
+            .OfType<IfStatementSyntax>().First());
+        Assert.Equal("File.Exists(ConfigFilePath)", guard.Condition.ToString());
+    }
+
+    /// <summary>
+    /// The notice ends on EVIDENCE the watched file is back, not on the
+    /// apply: a shrink-carry apply (a layered file's deletion applied past
+    /// the floor) leaves the watched file gone, and an unconditional
+    /// dismissal there retired the banner forever while its premise still
+    /// held. One existence check guards both halves: the machine's resolve
+    /// and the banner's dismissal.
+    /// </summary>
+    [Fact]
+    public void The_notice_ends_on_evidence_the_file_is_back()
+    {
+        var applied = Assert.Single(ConfigService().Method("Reload")
+            .Calls("_missingNoticeSource.OnReloadApplied"));
+
+        var guard = Assert.IsType<IfStatementSyntax>(applied.Ancestors()
+            .OfType<IfStatementSyntax>().First());
+        Assert.Equal("File.Exists(ConfigFilePath)", guard.Condition.ToString());
+
+        // The same evidence resolves the machine, in the same guard: an
+        // apply whose events were swallowed outside any bracket is the one
+        // chance to notice the file came back.
+        var see = Assert.Single(guard.Statement.Calls("_presence.SeePresent"));
+        Assert.True(see.SpanStart < applied.SpanStart,
+            "the machine was resolved after the banner was dismissed");
+    }
+
+    /// <summary>
+    /// The vanish question is asked only where the machine has no better
+    /// answer. With the watcher on, a pending or concluded delete already
+    /// owns the absence, and feeding the question anyway let the 900ms
+    /// clock conclude ahead of the machine's backstop and raise the banner
+    /// over a save that had merely lost an event.
+    /// </summary>
+    /// <remarks>
+    /// The no-watcher path is untouched: the machine never leaves Present
+    /// without events, so the conjunct is true there by construction, and
+    /// load verdicts remain the only evidence there is.
+    /// </remarks>
+    [Fact]
+    public void The_vanish_question_is_asked_only_where_the_machine_has_no_better_answer()
+    {
+        var observed = Assert.Single(ConfigService().Method("Reload")
+            .Calls("_vanishProtocol.Observed"));
+
+        // The conjunct is an operand of the same && chain that gates on the
+        // verdict agreeing with its count, not a second, separate question.
+        var chain = Assert.IsType<BinaryExpressionSyntax>(observed.Ancestors()
+            .OfType<BinaryExpressionSyntax>()
+            .Last(b => b.Kind() == SyntaxKind.LogicalAndExpression));
+        var operands = new List<string>();
+        void Collect(ExpressionSyntax e)
+        {
+            if (e is BinaryExpressionSyntax b && b.Kind() == SyntaxKind.LogicalAndExpression)
+            {
+                Collect(b.Left);
+                Collect(b.Right);
+            }
+            else
+            {
+                operands.Add(e.ToString().Trim());
+            }
+        }
+        Collect(chain);
+
+        Assert.Contains("_presence.AbsenceIsInstruction", operands);
+        Assert.Contains("ConfigReloadGate.VerdictAndCountAgree(defaultFiles, defaultFilesFound)", operands);
+    }
+
+    /// <summary>
+    /// An accepted deletion schedules one self-heal look. After the accept
+    /// the question is on hold and nothing asks again, so a file that
+    /// comes back silently (a Recycle-Bin restore) with no watcher would
+    /// leave the banner up over a present file until some unrelated
+    /// reload; the look gives that restore one reload of its own, and a
+    /// look that still finds nothing costs one declined rebuild.
+    /// </summary>
+    [Fact]
+    public void An_accepted_deletion_schedules_one_self_heal_look()
+    {
+        var accepted = ConfigService().Method("OnVanishAccepted");
+
+        var look = Assert.Single(accepted.Calls("_lookAgain.Schedule"));
+        Assert.Equal("ConfigVanishConfirmer.DefaultFloor", look.Arg(0));
+    }
+
+    /// <summary>
+    /// A load-defaults ask the reload could not honour is reported, not
+    /// silently dropped: the click cleared the one-shot key, so nothing
+    /// else will act on it, and the user's instruction dying unwitnessed is
+    /// the kind of silence this service does not get away with.
+    /// </summary>
+    [Fact]
+    public void A_swallowed_load_defaults_ask_is_reported()
+    {
+        var reload = ConfigService().Method("Reload");
+
+        var drops = reload.Calls(
+            "StaticLoggers.ConfigService.LogLoadDefaultsRequestDropped");
+        Assert.Equal(3, drops.Count);
+
+        // Each drop is guarded by the ask the read at the top consumed: a
+        // decline that never had the ask must not log a dropped one.
+        foreach (var drop in drops)
+        {
+            var guard = drop.Ancestors().OfType<IfStatementSyntax>()
+                .First(i => i.Condition.ToString().Contains("loadDefaultsRequested",
+                    StringComparison.Ordinal));
+            Assert.True(guard.Span.Contains(drop.Span));
+
+            // And in the file's (path, description) argument order: swapped,
+            // the Warning reads the path as the reason.
+            Assert.Equal("ConfigFilePath", drop.Arg(0));
+            Assert.StartsWith("\"", drop.Arg(1));
+        }
     }
 }
