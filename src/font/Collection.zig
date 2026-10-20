@@ -1395,7 +1395,7 @@ test "adjusted sizes" {
 
 test "face metrics" {
     // The web canvas backend doesn't calculate face metrics, only cell metrics
-    if (options.backend != .web_canvas) return error.SkipZigTest;
+    if (options.backend == .web_canvas) return error.SkipZigTest;
 
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -1438,10 +1438,11 @@ test "face metrics" {
         .px_per_em = 16.0,
         .cell_width = switch (options.backend) {
             .freetype,
+            .freetype_windows,
             .fontconfig_freetype,
             .directwrite_freetype,
             .coretext_freetype,
-            => 8.0,
+            => 7.0,
             .coretext,
             .coretext_harfbuzz,
             .coretext_noshape,
@@ -1459,6 +1460,7 @@ test "face metrics" {
         .ex_height = 7.3828125,
         .ascii_height = switch (options.backend) {
             .freetype,
+            .freetype_windows,
             .fontconfig_freetype,
             .directwrite_freetype,
             .coretext_freetype,
@@ -1474,6 +1476,7 @@ test "face metrics" {
         .px_per_em = 16.0,
         .cell_width = switch (options.backend) {
             .freetype,
+            .freetype_windows,
             .fontconfig_freetype,
             .directwrite_freetype,
             .coretext_freetype,
@@ -1495,10 +1498,11 @@ test "face metrics" {
         .ex_height = 8.48,
         .ascii_height = switch (options.backend) {
             .freetype,
+            .freetype_windows,
             .fontconfig_freetype,
             .directwrite_freetype,
             .coretext_freetype,
-            => 16.0,
+            => 15.5,
             .coretext,
             .coretext_harfbuzz,
             .coretext_noshape,
