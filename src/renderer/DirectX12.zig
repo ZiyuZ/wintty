@@ -104,6 +104,40 @@ const srv_heap_capacity: u32 = 64;
 /// Number of sampler descriptors in the shader-visible heap.
 const sampler_heap_capacity: u32 = 16;
 
+comptime {
+    // The swap chain depth and the device's frame-state count index each
+    // other (one frame state per back buffer); they are declared in two
+    // files and must not drift apart.
+    if (swap_chain_count != device.frame_count)
+        @compileError(std.fmt.comptimePrint(
+            "swap_chain_count ({d}) must equal device.frame_count ({d}): every back buffer owns exactly one frame state",
+            .{ swap_chain_count, device.frame_count },
+        ));
+    // srv_heap_capacity's floor from its comment, in code: the live set is
+    // frame_count frame states x 4 textures (grayscale + color atlas + the
+    // two custom-shader targets) plus the background image, the retiring
+    // worst case is 6 slots (two custom-shader target pairs and both
+    // atlases) for each of up to frame_count + 1 draws waiting on their
+    // fence, and a hide/show pair adds one whole generation (frame_count
+    // frame states x 4 textures) until the first frame after the show
+    // completes.
+    const live = device.frame_count * 4 + 1;
+    const retiring = 6 * (device.frame_count + 1);
+    const generation = device.frame_count * 4;
+    if (srv_heap_capacity < live + retiring + generation)
+        @compileError(std.fmt.comptimePrint(
+            "srv_heap_capacity ({d}) is below the worst transient of {d} (live {d} + retiring {d} + hide/show generation {d}) derived from device.frame_count; raise the capacity or shrink frame_count",
+            .{ srv_heap_capacity, live + retiring + generation, live, retiring, generation },
+        ));
+    // The free mask is one bit per slot: a capacity past its width wraps
+    // into recycling live slots.
+    if (srv_heap_capacity > @bitSizeOf(u128))
+        @compileError(std.fmt.comptimePrint(
+            "srv_heap_capacity ({d}) exceeds the free mask's {d} bits; widen the mask or shrink the capacity",
+            .{ srv_heap_capacity, @bitSizeOf(u128) },
+        ));
+}
+
 // --- GraphicsAPI contract: mutable state ---
 
 /// Runtime blending mode, set by GenericRenderer when config changes.
