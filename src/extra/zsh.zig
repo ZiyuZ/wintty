@@ -2,6 +2,7 @@ const std = @import("std");
 
 const Config = @import("../config/Config.zig");
 const Action = @import("../cli.zig").ghostty.Action;
+const names = @import("names.zig");
 
 /// A zsh completions configuration that contains all the available commands
 /// and options.
@@ -28,13 +29,17 @@ fn writeZshCompletions(writer: *std.Io.Writer) !void {
         \\#compdef ghostty
         \\
         \\_fonts () {
-        \\  local font_list=$(ghostty +list-fonts | grep -Z '^[A-Z]')
+        \\  local font_list=$(ghostty +
+        ++ names.list_fonts_action ++
+        \\ | grep -Z '^[A-Z]')
         \\  local fonts=(${(f)font_list})
         \\  _describe -t fonts 'fonts' fonts
         \\}
         \\
         \\_themes() {
-        \\  local theme_list=$(ghostty +list-themes | sed -E 's/^(.*) \(.*$/\1/')
+        \\  local theme_list=$(ghostty +
+        ++ names.list_themes_action ++
+        \\ | sed -E 's/^(.*) \(.*$/\1/')
         \\  local themes=(${(f)theme_list})
         \\  _describe -t themes 'themes' themes
         \\}
@@ -50,13 +55,13 @@ fn writeZshCompletions(writer: *std.Io.Writer) !void {
         try writer.writeAll("    \"--");
         try writer.writeAll(field.name);
 
-        if (std.mem.startsWith(u8, field.name, "font-family")) {
+        if (std.mem.startsWith(u8, field.name, names.font_family)) {
             try writer.writeAll(equals_required);
             try writer.writeAll("_fonts");
-        } else if (std.mem.eql(u8, "theme", field.name)) {
+        } else if (std.mem.eql(u8, names.theme, field.name)) {
             try writer.writeAll(equals_required);
             try writer.writeAll("_themes");
-        } else if (std.mem.eql(u8, "working-directory", field.name)) {
+        } else if (std.mem.eql(u8, names.working_directory, field.name)) {
             try writer.writeAll(equals_required);
             try writer.writeAll("{_files -/}");
         } else if (field.type == Config.RepeatablePath) {
@@ -200,7 +205,7 @@ fn writeZshCompletions(writer: *std.Io.Writer) !void {
                                 try writer.writeAll(")");
                             },
                             else => {
-                                if (std.mem.eql(u8, "config-file", opt.name)) {
+                                if (std.mem.eql(u8, names.config_file, opt.name)) {
                                     try writer.writeAll("_files");
                                 } else try writer.writeAll("( )");
                             },
@@ -208,7 +213,7 @@ fn writeZshCompletions(writer: *std.Io.Writer) !void {
                     },
                     else => {
                         try writer.writeAll(equals_required);
-                        if (std.mem.eql(u8, "config-file", opt.name)) {
+                        if (std.mem.eql(u8, names.config_file, opt.name)) {
                             try writer.writeAll("_files");
                         } else try writer.writeAll("( )");
                     },
@@ -228,4 +233,11 @@ fn writeZshCompletions(writer: *std.Io.Writer) !void {
         \\_ghostty "$@"
         \\
     );
+}
+
+test {
+    // The generators are reached only through build data in
+    // resource-installing builds; reference the completions here so
+    // `zig build test` also analyzes the comptime checks in names.zig.
+    _ = completions;
 }
