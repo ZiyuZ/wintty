@@ -9,6 +9,11 @@ const global = @import("../global.zig");
 
 const log = std.log.scoped(.shadertoy);
 
+const cursor = @import("cursor.zig");
+const mirrors = @import("shader_mirrors.zig");
+
+const prefix_source = @embedFile("shaders/shadertoy_prefix.glsl");
+
 /// The uniform struct used for shadertoy shaders.
 pub const Uniforms = extern struct {
     resolution: [3]f32 align(16),
@@ -39,6 +44,45 @@ pub const Uniforms = extern struct {
     selection_background_color: [4]f32 align(16),
     selection_foreground_color: [4]f32 align(16),
 };
+
+comptime {
+    @setEvalBranchQuota(200000);
+
+    // generic.zig writes cursor.Style ordinals straight into
+    // iCurrentCursorStyle / iPreviousCursorStyle and the prefix hands the
+    // same values back as defines, so every style needs its exact copy.
+    for (@typeInfo(cursor.Style).@"enum".fields) |field| {
+        mirrors.expectMirrored(
+            prefix_source,
+            "CURSORSTYLE_" ++ mirrors.upper(field.name),
+            std.fmt.comptimePrint("{d}", .{field.value}),
+            "shadertoy_prefix.glsl CURSORSTYLE defines vs cursor.Style",
+        );
+    }
+
+    // The Globals block and Uniforms are one block: same members, same
+    // order, same std140 offsets and total size, checked member by member
+    // against the block the shader declares, so a swap of two members or a
+    // rename on either side fails the build instead of misaligning the
+    // byte-for-byte upload. The palette is the one array: 256 vec3 entries,
+    // so its std140 stride is 16 bytes.
+    mirrors.expectBlockLayout(
+        prefix_source,
+        "Globals",
+        Uniforms,
+        .{
+            // The GLSL name follows shadertoy's iTimeCursorChange; the
+            // Zig field predates it and spells the words the other way.
+            .{ "iTimeCursorChange", "cursor_change_time" },
+        },
+        "shadertoy_prefix.glsl Globals vs shadertoy.Uniforms",
+    );
+    mirrors.expectSize(
+        @FieldType(Uniforms, "palette"),
+        256 * 16,
+        "shadertoy.Uniforms palette stride vs std140 vec3[256]",
+    );
+}
 
 /// The target to load shaders for.
 pub const Target = enum { glsl, msl, hlsl };
@@ -209,8 +253,7 @@ fn logCompileDiagnostics(alloc: Allocator, glsl: [:0]const u8, path: []const u8)
 /// will convert the ShaderToy shader into a valid GLSL shader that can be
 /// compiled and linked.
 pub fn glslFromShader(writer: *std.Io.Writer, src: []const u8) !void {
-    const prefix = @embedFile("shaders/shadertoy_prefix.glsl");
-    try writer.writeAll(prefix);
+    try writer.writeAll(prefix_source);
     try writer.writeAll("\n\n");
     try writer.writeAll(src);
 }

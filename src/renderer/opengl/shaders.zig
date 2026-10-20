@@ -7,6 +7,12 @@ const Pipeline = @import("Pipeline.zig");
 
 const log = std.log.scoped(.opengl);
 
+const mirrors = @import("../shader_mirrors.zig");
+
+const cell_text_v_source = @embedFile("../shaders/glsl/cell_text.v.glsl");
+const bg_image_v_source = @embedFile("../shaders/glsl/bg_image.v.glsl");
+const common_source = @embedFile("../shaders/glsl/common.glsl");
+
 const pipeline_descs: []const struct { [:0]const u8, PipelineDescription } =
     &.{
         .{ "bg_color", .{
@@ -298,6 +304,99 @@ pub const BgImage = extern struct {
         };
     };
 };
+
+comptime {
+    // The vertex shader reads CellText.bools as raw bits through these
+    // constants, so each packed field needs its exact mask there.
+    @setEvalBranchQuota(200000);
+    for (std.meta.fields(@FieldType(CellText, "bools")), 0..) |field, bit| {
+        if (std.mem.startsWith(u8, field.name, "_")) continue;
+        mirrors.expectMirrored(
+            cell_text_v_source,
+            mirrors.upper(field.name),
+            std.fmt.comptimePrint("{d}u", .{@as(u32, 1) << @as(u5, @intCast(bit))}),
+            "cell_text.v.glsl CellText.bools vs opengl.CellText",
+        );
+    }
+
+    // The info byte packs Info as position[3:0], fit[5:4], repeat[6]:
+    // position ordinals go in unshifted, fit ordinals shifted by 4.
+    mirrors.expectMirrored(
+        bg_image_v_source,
+        "BG_IMAGE_POSITION",
+        "15u",
+        "bg_image.v.glsl BgImage.Info position mask vs opengl.BgImage",
+    );
+    for (@typeInfo(BgImage.Info.Position).@"enum".fields) |field| {
+        mirrors.expectMirrored(
+            bg_image_v_source,
+            "BG_IMAGE_" ++ mirrors.upper(field.name),
+            std.fmt.comptimePrint("{d}u", .{field.value}),
+            "bg_image.v.glsl BgImage.Info.Position vs opengl.BgImage",
+        );
+    }
+    mirrors.expectMirrored(
+        bg_image_v_source,
+        "BG_IMAGE_FIT",
+        "3u << 4",
+        "bg_image.v.glsl BgImage.Info fit mask vs opengl.BgImage",
+    );
+    for (@typeInfo(BgImage.Info.Fit).@"enum".fields) |field| {
+        const glsl_name = if (std.mem.eql(u8, field.name, "none"))
+            "NO_FIT"
+        else
+            mirrors.upper(field.name);
+        mirrors.expectMirrored(
+            bg_image_v_source,
+            "BG_IMAGE_" ++ glsl_name,
+            std.fmt.comptimePrint("{d}u << 4", .{field.value}),
+            "bg_image.v.glsl BgImage.Info.Fit vs opengl.BgImage",
+        );
+    }
+    mirrors.expectMirrored(
+        bg_image_v_source,
+        "BG_IMAGE_REPEAT",
+        "1u << 6",
+        "bg_image.v.glsl BgImage.Info repeat bit vs opengl.BgImage",
+    );
+
+    // common.glsl carries the Globals block the vertex shaders include and
+    // the masks for its packed bools: pin the block to Uniforms member by
+    // member, and every mask to its bit. The packed spellings differ on
+    // purpose (a 2u16/4u8 field against one uint member) and are renamed
+    // here, which is also what documents them.
+    mirrors.expectBlockLayout(
+        common_source,
+        "Globals",
+        Uniforms,
+        .{
+            .{ "grid_size_packed_2u16", "grid_size" },
+            .{ "cursor_pos_packed_2u16", "cursor_pos" },
+            .{ "cursor_color_packed_4u8", "cursor_color" },
+            .{ "bg_color_packed_4u8", "bg_color" },
+            .{ "bools", "bools" },
+        },
+        "common.glsl Globals vs opengl.Uniforms",
+    );
+    for (std.meta.fields(@FieldType(Uniforms, "bools")), 0..) |field, bit| {
+        if (std.mem.startsWith(u8, field.name, "_")) continue;
+        mirrors.expectMirrored(
+            common_source,
+            mirrors.upper(field.name),
+            std.fmt.comptimePrint("{d}u", .{@as(u32, 1) << @as(u5, @intCast(bit))}),
+            "common.glsl Uniforms.bools vs opengl.Uniforms",
+        );
+    }
+    for (std.meta.fields(@FieldType(Uniforms, "padding_extend")), 0..) |field, bit| {
+        if (std.mem.startsWith(u8, field.name, "_")) continue;
+        mirrors.expectMirrored(
+            common_source,
+            "EXTEND_" ++ mirrors.upper(field.name),
+            std.fmt.comptimePrint("{d}u", .{@as(u32, 1) << @as(u5, @intCast(bit))}),
+            "common.glsl padding extend vs opengl.Uniforms",
+        );
+    }
+}
 
 /// Initialize our custom shader pipelines. The shaders argument is a
 /// set of shader source code, not file paths.
