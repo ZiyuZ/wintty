@@ -1,4 +1,5 @@
 const std = @import("std");
+const translate_c = @import("translate_c");
 
 pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
@@ -25,6 +26,38 @@ pub fn build(b: *std.Build) !void {
         const apple_sdk = @import("apple_sdk");
         try apple_sdk.addPaths(b, lib);
     }
+
+    // aro, which backs translate-c in zig 0.16, cannot parse the __ptr64
+    // attribute the Windows SDK uses in basetsd.h, so a translation that
+    // reaches windows.h fails. sentry.h includes windows.h for exactly one
+    // declaration, the EXCEPTION_POINTERS field of sentry_ucontext_s, which
+    // nothing on the Zig side references. Suppress the include and supply a
+    // stand-in for that field: two pointers, matching the real
+    // EXCEPTION_POINTERS (PEXCEPTION_RECORD, PCONTEXT). The stand-in used to
+    // be a single int, which made Zig's view of sentry_ucontext_s four bytes
+    // where the C side's is sixteen.
+    var translate_args: []const []const u8 = &.{
+        // Matches -DSENTRY_BUILD_STATIC for the C sources below: without
+        // it sentry.h decorates every function with __declspec(dllimport).
+        "-DSENTRY_BUILD_STATIC=1",
+    };
+    if (target.result.os.tag == .windows) {
+        translate_args = &.{
+            "-DSENTRY_BUILD_STATIC=1",
+            "-D_WINDOWS_=1",
+            "-DEXCEPTION_POINTERS=struct{void*_record;void*_context;}",
+        };
+    }
+
+    try translate_c.addImportToModule(b, "sentry_c", module, .{
+        .source = .{ .includes = .{
+            .files = &.{.{ .path = "sentry.h" }},
+        } },
+        .target = target,
+        .optimize = optimize,
+        .link_libs = &.{lib},
+        .extra_args = translate_args,
+    });
 
     var flags: std.ArrayList([]const u8) = .empty;
     defer flags.deinit(b.allocator);
@@ -71,7 +104,6 @@ pub fn build(b: *std.Build) !void {
     }
 
     if (b.lazyDependency("sentry", .{})) |upstream| {
-        module.addIncludePath(upstream.path("include"));
         lib.root_module.addIncludePath(upstream.path("include"));
         lib.root_module.addIncludePath(upstream.path("src"));
         lib.root_module.addCSourceFiles(.{

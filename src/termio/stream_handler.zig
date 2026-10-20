@@ -143,6 +143,10 @@ pub const StreamHandler = struct {
     /// and prompt starts are not forwarded. See termio.program_status.
     program_status: *const std.atomic.Value(bool) = &termio.program_status.enabled,
 
+    /// Whether DECRQCRA may report the checksum of an area of the screen,
+    /// and XTCHECKSUM may change how it's calculated.
+    xt_checksum_report: bool,
+
     //---------------------------------------------------------------
     // Internal state
 
@@ -257,8 +261,10 @@ pub const StreamHandler = struct {
         self.clipboard_write_limit = config.clipboard_write_limit;
         self.tmux_control_mode = config.tmux_control_mode;
         self.enquiry_response = config.enquiry_response;
+        self.xt_checksum_report = config.xt_checksum_report;
         self.terminal.setDefaultCursorStyle(config.cursor_style);
         self.terminal.setDefaultCursorBlink(config.cursor_blink);
+        self.terminal.setDefaultXtChecksum(config.xt_checksum_extension);
 
         // The config could have changed any of our colors so update mode 2031
         self.messageWriter(.{ .color_scheme_report = .{ .force = false } });
@@ -421,16 +427,10 @@ pub const StreamHandler = struct {
                 @branchHint(.likely);
                 self.terminal.setCursorPos(value.row, value.col);
             },
-            .cursor_col => self.terminal.setCursorPos(self.terminal.screens.active.cursor.y + 1, value.value),
-            .cursor_row => self.terminal.setCursorPos(value.value, self.terminal.screens.active.cursor.x + 1),
-            .cursor_col_relative => self.terminal.setCursorPos(
-                self.terminal.screens.active.cursor.y + 1,
-                self.terminal.screens.active.cursor.x + 1 +| value.value,
-            ),
-            .cursor_row_relative => self.terminal.setCursorPos(
-                self.terminal.screens.active.cursor.y + 1 +| value.value,
-                self.terminal.screens.active.cursor.x + 1,
-            ),
+            .cursor_col => self.terminal.setCursorCol(value.value),
+            .cursor_row => self.terminal.setCursorRow(value.value),
+            .cursor_col_relative => self.terminal.cursorColRelative(value.value),
+            .cursor_row_relative => self.terminal.cursorRowRelative(value.value),
             .cursor_style => self.terminal.setCursorStyle(value),
             .erase_display_below => self.terminal.eraseDisplay(.below, value),
             .erase_display_above => self.terminal.eraseDisplay(.above, value),
@@ -488,7 +488,12 @@ pub const StreamHandler = struct {
             .protected_mode_iso => self.terminal.setProtectedMode(.iso),
             .protected_mode_dec => self.terminal.setProtectedMode(.dec),
             .mouse_shift_capture => self.terminal.flags.mouse_shift_capture = if (value) .true else .false,
+            .xt_checksum_extension => if (self.xt_checksum_report) {
+                self.terminal.flags.xt_checksum = value.flags;
+            },
+            .request_xt_checksum => self.reportXtChecksum(value),
             .size_report => self.sendSizeReport(value),
+            .resize_window => self.surfaceMessageWriter(.{ .resize_window = value }),
             .xtversion => try self.reportXtversion(),
             .device_attributes => try self.deviceAttributes(value),
             .device_status => try self.deviceStatusReport(value.request),
@@ -526,6 +531,9 @@ pub const StreamHandler = struct {
             .clipboard_contents => try self.clipboardContents(value.kind, value.data),
             .semantic_prompt => try self.semanticPrompt(value),
             .mouse_shape => try self.setMouseShape(value),
+            .mouse_shape_reset => try self.setMouseShape(
+                if (self.terminal.flags.mouse_event != .none) .default else .text,
+            ),
             .configure_charset => self.configureCharset(value.slot, value.charset),
             .set_attribute => {
                 @branchHint(.likely);
@@ -560,6 +568,7 @@ pub const StreamHandler = struct {
             .title_push,
             .title_pop,
             .kitty_dnd,
+            .osc_unknown,
             => {},
 
             .program_status => try self.programStatus(value),
@@ -836,6 +845,24 @@ pub const StreamHandler = struct {
 
     fn requestModeUnknown(self: *StreamHandler, mode_raw: u16, ansi: bool) !void {
         self.sendModeReport(self.terminal.modes.getReport(.{ .value = mode_raw, .ansi = ansi }));
+    }
+
+    fn reportXtChecksum(self: *StreamHandler, req: terminal.xt_checksum.Request) void {
+        if (!self.xt_checksum_report) return;
+        var data: termio.Message.WriteReq.Small.Array = undefined;
+        var writer: std.Io.Writer = .fixed(&data);
+        terminal.xt_checksum.encode(
+            &writer,
+            req.id,
+            self.terminal.rectXtChecksum(req),
+        ) catch |err| {
+            log.err("error encoding checksum report err={}", .{err});
+            return;
+        };
+        self.messageWriter(.{ .write_small = .{
+            .data = data,
+            .len = @intCast(writer.buffered().len),
+        } });
     }
 
     fn sendModeReport(self: *StreamHandler, report: terminal.modes.Report) void {
@@ -2306,6 +2333,7 @@ pub const StreamHandler = struct {
             .csi_14_t => self.messageWriter(.{ .size_report = .csi_14_t }),
             .csi_16_t => self.messageWriter(.{ .size_report = .csi_16_t }),
             .csi_18_t => self.messageWriter(.{ .size_report = .csi_18_t }),
+            .csi_19_t => self.messageWriter(.{ .size_report = .csi_19_t }),
             .csi_21_t => self.surfaceMessageWriter(.{ .report_title = .csi_21_t }),
             .iterm2_report_cell_size => self.messageWriter(.{
                 .size_report = .iterm2_report_cell_size,
@@ -2594,6 +2622,7 @@ const TestHandler = struct {
             .clipboard_write = .allow,
             .clipboard_write_limit = 64 * 1024 * 1024,
             .tmux_control_mode = false,
+            .xt_checksum_report = false,
             .apc = .{},
             .dcs = .{},
             .multipart_iterm2 = .{},

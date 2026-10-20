@@ -886,6 +886,12 @@ typedef struct {
   uint32_t height;
 } ghostty_action_initial_size_s;
 
+// apprt.action.ResizeWindow
+typedef struct {
+  uint32_t width;
+  uint32_t height;
+} ghostty_action_resize_window_s;
+
 // apprt.action.CellSize
 typedef struct {
   uint32_t width;
@@ -1170,6 +1176,8 @@ typedef enum {
   GHOSTTY_ACTION_UNPIN_TAB,
   GHOSTTY_ACTION_MOVE_GROUP,
   GHOSTTY_ACTION_PROGRAM_STATUS,
+
+    GHOSTTY_ACTION_RESIZE_WINDOW,
 } ghostty_action_tag_e;
 
 typedef union {
@@ -1183,6 +1191,7 @@ typedef union {
   ghostty_action_resize_split_s resize_split;
   ghostty_action_size_limit_s size_limit;
   ghostty_action_initial_size_s initial_size;
+  ghostty_action_resize_window_s resize_window;
   ghostty_action_cell_size_s cell_size;
   ghostty_action_scrollbar_s scrollbar;
   ghostty_action_inspector_e inspector;
@@ -1555,6 +1564,7 @@ GHOSTTY_API bool ghostty_surface_key_is_binding(ghostty_surface_t,
                                                    ghostty_input_key_s,
                                                    ghostty_binding_flags_e*);
 GHOSTTY_API void ghostty_surface_text(ghostty_surface_t, const char*, uintptr_t);
+GHOSTTY_API void ghostty_surface_paste_text(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API void ghostty_surface_preedit(ghostty_surface_t, const char*, uintptr_t);
 GHOSTTY_API bool ghostty_surface_mouse_captured(ghostty_surface_t);
 GHOSTTY_API bool ghostty_surface_mouse_button(ghostty_surface_t,

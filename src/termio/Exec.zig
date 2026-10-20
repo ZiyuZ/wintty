@@ -929,11 +929,7 @@ pub const Config = struct {
 };
 
 const Subprocess = struct {
-    const c = @cImport({
-        @cInclude("errno.h");
-        @cInclude("signal.h");
-        @cInclude("unistd.h");
-    });
+    const c = if (builtin.os.tag != .windows) @import("posix_c") else {};
 
     arena: std.heap.ArenaAllocator,
     cwd: ?[:0]const u8,
@@ -1004,7 +1000,7 @@ const Subprocess = struct {
                 break :ghostty_path;
             }
 
-            var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+            var exe_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
             const exe_bin_path = exe_buf[0 .. std.process.executablePath(
                 global.io(),
                 &exe_buf,
@@ -1044,7 +1040,7 @@ const Subprocess = struct {
         if (comptime builtin.target.os.tag.isDarwin()) darwin: {
             const resources_dir = cfg.resources_dir orelse break :darwin;
 
-            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
 
             const xdg_data_dir_key = "XDG_DATA_DIRS";
             if (std.fmt.bufPrint(&buf, "{s}/..", .{resources_dir})) |data_dir| {

@@ -54,7 +54,7 @@ pub fn expand(
         }
     }
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var it = std.mem.tokenizeScalar(u8, PATH, std.fs.path.delimiter);
     var seen_eacces = false;
     while (it.next()) |search_path| {
@@ -68,8 +68,8 @@ pub fn expand(
         if (builtin.os.tag == .windows and !has_extension and pathext_list != null) {
             for (pathext_list.?) |ext| {
                 const combined_len = cmd.len + ext.len;
-                if (combined_len > std.fs.max_path_bytes) return error.PathTooLong;
-                var cmd_with_ext: [std.fs.max_path_bytes]u8 = undefined;
+                if (combined_len > std.Io.Dir.max_path_bytes) return error.PathTooLong;
+                var cmd_with_ext: [std.Io.Dir.max_path_bytes]u8 = undefined;
                 @memcpy(cmd_with_ext[0..cmd.len], cmd);
                 @memcpy(cmd_with_ext[cmd.len..][0..ext.len], ext);
                 const cmd_ext_str = cmd_with_ext[0..combined_len];
@@ -94,7 +94,7 @@ fn tryPathImpl(
     alloc: Allocator,
     search_path: []const u8,
     cmd: []const u8,
-    path_buf: *[std.fs.max_path_bytes]u8,
+    path_buf: *[std.Io.Dir.max_path_bytes]u8,
     seen_eacces: *bool,
 ) !?[]u8 {
     const path_len = search_path.len + cmd.len + 1;

@@ -163,12 +163,14 @@ pub fn encodeWriter(
 /// Returns true if the data looks safe to paste. Data is considered
 /// unsafe if it contains any of the following:
 ///
-/// - `\n`: Newlines can be used to inject commands.
-/// - `\r`: Line editors accept the current line on carriage return, so
-///   it injects commands the same way a newline does. `encode` also
-///   turns every newline into one for an unbracketed paste.
+/// - `\n` or `\r`: Line terminators can be used to inject commands.
+///   A carriage return is what the Enter key sends, and an unbracketed
+///   paste converts newlines to carriage returns anyway, so the two are
+///   equivalent on the input stream. Other terminals that warn on
+///   multi-line pastes (iTerm2, Windows Terminal, kitty) treat both
+///   bytes as line terminators as well.
 /// - U+0085 (NEL): Some programs treat it as a line break.
-/// - `\x1b[201~`: This is the end of a bracketed paste. This cane be used
+/// - `\x1b[201~`: This is the end of a bracketed paste. This can be used
 ///   to exit a bracketed paste and inject commands.
 ///
 /// We consider any scenario unsafe regardless of current terminal state.
@@ -177,7 +179,7 @@ pub fn encodeWriter(
 /// should raise suspicion that the producer of the paste data is
 /// acting strangely.
 pub fn isSafe(data: []const u8) bool {
-    return std.mem.indexOfAny(u8, data, "\n\r") == null and
+    return std.mem.indexOfAny(u8, data, "\r\n") == null and
         std.mem.indexOf(u8, data, "\u{0085}") == null and
         std.mem.indexOf(u8, data, "\x1b[201~") == null;
 }
@@ -186,7 +188,7 @@ pub fn isSafe(data: []const u8) bool {
 /// encoded. This is the terminal-state-aware counterpart of `isSafe`:
 ///
 /// - Bracketed (mode 2004 on): the program receives the data as one
-///   framed unit, so newlines are fine. The data is unsafe only if it
+///   framed unit, so line terminators are fine. The data is unsafe only if it
 ///   contains the end of the frame (`\x1b[201~`), which would let the
 ///   rest of the data escape the frame and inject commands.
 /// - Unbracketed: the same rule as `isSafe`.
@@ -201,14 +203,17 @@ pub fn isSafeWith(data: []const u8, opts: Options) bool {
 test isSafe {
     const testing = std.testing;
     try testing.expect(isSafe("hello"));
+    try testing.expect(isSafe("hello\tworld"));
     try testing.expect(!isSafe("hello\n"));
     try testing.expect(!isSafe("hello\nworld"));
     try testing.expect(!isSafe("he\x1b[201~llo"));
 
-    // A carriage return accepts the line just like a newline does.
+    // A carriage return is the Enter key on the input stream, so it
+    // can execute a command exactly like a newline.
     try testing.expect(!isSafe("hello\r"));
     try testing.expect(!isSafe("hello\rworld"));
     try testing.expect(!isSafe("hello\r\nworld"));
+    try testing.expect(!isSafe("\r"));
     try testing.expect(!isSafe("hello\u{0085}world"));
 
     // A codepoint that merely contains the NEL continuation byte is fine.
@@ -218,10 +223,11 @@ test isSafe {
 test isSafeWith {
     const testing = std.testing;
 
-    // Bracketed: newlines are fine, the frame terminator is not.
+    // Bracketed: line terminators are fine, the frame terminator is not.
     try testing.expect(isSafeWith("hello", .{ .bracketed = true }));
     try testing.expect(isSafeWith("hello\nworld", .{ .bracketed = true }));
     try testing.expect(isSafeWith("hello\rworld", .{ .bracketed = true }));
+    try testing.expect(isSafeWith("hello\r\nworld", .{ .bracketed = true }));
     try testing.expect(!isSafeWith("he\x1b[201~llo", .{ .bracketed = true }));
     try testing.expect(!isSafeWith("hello\n\x1b[201~", .{ .bracketed = true }));
 
@@ -229,6 +235,7 @@ test isSafeWith {
     try testing.expect(isSafeWith("hello", .{ .bracketed = false }));
     try testing.expect(!isSafeWith("hello\nworld", .{ .bracketed = false }));
     try testing.expect(!isSafeWith("hello\rworld", .{ .bracketed = false }));
+    try testing.expect(!isSafeWith("hello\r", .{ .bracketed = false }));
     try testing.expect(!isSafeWith("he\x1b[201~llo", .{ .bracketed = false }));
 }
 

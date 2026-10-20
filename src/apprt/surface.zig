@@ -105,6 +105,10 @@ pub const Message = union(enum) {
     /// Report the window title back to the terminal
     report_title: ReportTitleStyle,
 
+    /// Resize the window to the given grid size, as requested by the
+    /// running program (CSI 8 t).
+    resize_window: terminal.StreamAction.ResizeWindow,
+
     /// Set the mouse shape.
     set_mouse_shape: terminal.MouseShape,
 
@@ -244,6 +248,8 @@ pub const Message = union(enum) {
                 .report => |r| r.destroy(),
                 .reset, .prompt_start => {},
             },
+            // Plain data; nothing owned.
+            .resize_window => {},
 
             .set_title,
             .report_title,
@@ -333,6 +339,7 @@ pub const Message = union(enum) {
             .search_total,
             .search_selected,
             .redraw,
+            .resize_window,
             => true,
         };
     }
@@ -635,7 +642,7 @@ test "surface message variants are all accounted for by the push give-up path" {
     // Make that decision, then bump this count. Without the guard a new
     // owning variant compiles and leaks silently on every drop.
     const fields = @typeInfo(Message).@"union".fields;
-    try std.testing.expectEqual(@as(usize, 29), fields.len);
+    try std.testing.expectEqual(@as(usize, 30), fields.len);
 }
 
 test "the child-exit notice is the one message push may not carry" {

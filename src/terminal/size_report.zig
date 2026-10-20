@@ -12,6 +12,8 @@ pub const Style = lib.Enum(lib.target, &.{
     "csi_16_t",
     // XTWINOPS: report text area size in characters
     "csi_18_t",
+    // XTWINOPS: report screen size in characters
+    "csi_19_t",
     // iTerm2 OSC 1337 ReportCellSize response.
     "iterm2_report_cell_size",
 });
@@ -80,6 +82,16 @@ pub fn encode(
             },
         ),
 
+        // We have no knowledge of the physical screen size so, like VTE,
+        // we report the size of the text area in characters.
+        .csi_19_t => try writer.print(
+            "\x1b[9;{};{}t",
+            .{
+                size.rows,
+                size.columns,
+            },
+        ),
+
         .iterm2_report_cell_size => try writer.print(
             // iTerm2's response shape is `ReportCellSize=H;W;scale`
             // where scale is the device-pixel ratio and H,W are the
@@ -139,6 +151,14 @@ test "encode csi 18 t" {
     try std.testing.expectEqualStrings("\x1b[8;24;80t", writer.buffered());
 }
 
+test "encode csi 19 t" {
+    var buf: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try encode(&writer, .csi_19_t, testSize());
+
+    try std.testing.expectEqualStrings("\x1b[9;24;80t", writer.buffered());
+}
+
 test "encode iterm2 report cell size" {
     var buf: [64]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
@@ -183,6 +203,10 @@ test "encode max values for all fields" {
         .{
             .style = .csi_18_t,
             .expected = "\x1b[8;65535;65535t",
+        },
+        .{
+            .style = .csi_19_t,
+            .expected = "\x1b[9;65535;65535t",
         },
         .{
             .style = .iterm2_report_cell_size,

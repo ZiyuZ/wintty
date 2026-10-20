@@ -300,10 +300,15 @@ public class GhosttyActionTagHeaderParityTests
                 $"{what} {at} should have been reported as [{string.Join(", ", expected)}] " +
                 $"but the check reported [{string.Join(", ", reported)}]");
 
-            // The tail member is always in the moved range, so an edit anywhere
-            // has to produce something. Belt and braces on the comparison above
-            // going vacuous if both sides ever came back empty.
-            Assert.NotEmpty(reported);
+            // Belt and braces on the comparison above going vacuous if both
+            // sides ever came back empty. The managed enum is a partial
+            // mirror, so a position at or past the highest mirrored ordinal
+            // legitimately reports nothing (the header tail can carry a tag
+            // the apprt does not handle); positions below it -- position 0
+            // always among them -- must report, which is what keeps this
+            // guard from passing on a check that has gone toothless.
+            if (expected.Length > 0)
+                Assert.NotEmpty(reported);
         }
     }
 

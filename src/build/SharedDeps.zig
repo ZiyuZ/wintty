@@ -288,26 +288,11 @@ pub fn add(
     step.root_module.addImport("uucode", self.uucode_mod);
 
     // C imports for locale constants and functions
-    {
-        const c = b.addTranslateC(.{
-            .root_source_file = b.path("src/os/locale.c"),
-            .target = target,
-            .optimize = optimize,
-        });
-        if (target.result.os.tag.isDarwin()) {
-            const libc = try std.zig.LibCInstallation.findNative(
-                b.allocator,
-                b.graph.io,
-                .{
-                    .environ_map = &b.graph.environ_map,
-                    .target = &target.result,
-                    .verbose = false,
-                },
-            );
-            c.addSystemIncludePath(.{ .cwd_relative = libc.sys_include_dir.? });
-        }
-        step.root_module.addImport("locale-c", c.createModule());
-    }
+    try translate_c.addImportToModule(b, "locale-c", step.root_module, .{
+        .source = .{ .file = b.path("src/os/locale.c") },
+        .target = target,
+        .optimize = optimize,
+    });
 
     // C imports needed to manage/create PTYs
     switch (target.result.os.tag) {
@@ -315,27 +300,38 @@ pub fn add(
         .linux,
         .macos,
         => {
-            const c = b.addTranslateC(.{
-                .root_source_file = b.path("src/pty.c"),
+            try translate_c.addImportToModule(b, "pty-c", step.root_module, .{
+                .source = .{ .file = b.path("src/pty.c") },
                 .target = target,
                 .optimize = optimize,
             });
-            switch (target.result.os.tag) {
-                .macos => {
-                    const libc = try std.zig.LibCInstallation.findNative(
-                        b.allocator,
-                        b.graph.io,
-                        .{
-                            .environ_map = &b.graph.environ_map,
-                            .target = &target.result,
-                            .verbose = false,
-                        },
-                    );
-                    c.addSystemIncludePath(.{ .cwd_relative = libc.sys_include_dir.? });
-                },
-                else => {},
-            }
-            step.root_module.addImport("pty-c", c.createModule());
+        },
+        else => {},
+    }
+
+    // POSIX C imports that are used throughout Ghostty on a general basis.
+    // (note: errno is C stdlib but we just include it here because that's
+    // where it's generally included otherwise)
+    // Windows: pwd.h/unistd.h do not exist under the MSVC target and the
+    // fork's Windows code paths never reference this module, so the
+    // translation is registered on Unixes only. Import sites gate with the
+    // same condition (see src/os/passwd.zig).
+    switch (target.result.os.tag) {
+        .freebsd,
+        .linux,
+        .macos,
+        => {
+            try translate_c.addImportToModule(b, "posix_c", step.root_module, .{
+                .source = .{ .includes = .{ .files = &.{
+                    .{ .path = "errno.h" },
+                    .{ .path = "pwd.h" },
+                    .{ .path = "signal.h" },
+                    .{ .path = "sys/types.h" },
+                    .{ .path = "unistd.h" },
+                } } },
+                .target = target,
+                .optimize = optimize,
+            });
         },
         else => {},
     }
@@ -552,6 +548,18 @@ pub fn add(
             step.root_module.addLibraryPath(.{ .cwd_relative = path });
         } else |_| {}
     }
+
+    // nothings/stb headers. The fork ships only stb_image_resize.h here
+    // (src/stb/main.zig translates what it needs itself); nothing in the
+    // tree imports stb_c today, so the list matches the files that exist.
+    try translate_c.addImportToModule(b, "stb_c", step.root_module, .{
+        .source = .{ .includes = .{ .files = &.{
+            .{ .path = "stb_image_resize.h" },
+        } } },
+        .target = target,
+        .optimize = optimize,
+        .include_paths = &.{b.path("src/stb")},
+    });
 
     // C files
     step.root_module.link_libc = true;
@@ -820,7 +828,7 @@ pub fn add(
 
         switch (self.config.app_runtime) {
             .none => {},
-            .gtk => try self.addGtkNg(step),
+            .gtk => try self.addGtk(step),
         }
     }
 
@@ -832,7 +840,7 @@ pub fn add(
 }
 
 /// Setup the dependencies for the GTK apprt build.
-fn addGtkNg(
+fn addGtk(
     self: *const SharedDeps,
     step: *std.Build.Step.Compile,
 ) !void {
@@ -843,25 +851,24 @@ fn addGtkNg(
     else
         step.root_module.optimize.?;
 
-    const gobject_ = b.lazyDependency("gobject", .{
+    const gobject = b.lazyDependency("gobject", .{
         .target = target,
         .optimize = optimize,
-    });
-    if (gobject_) |gobject| {
-        const gobject_imports = .{
-            .{ "adw", "adw1" },
-            .{ "gdk", "gdk4" },
-            .{ "gio", "gio2" },
-            .{ "glib", "glib2" },
-            .{ "glibunix", "glibunix2" },
-            .{ "gobject", "gobject2" },
-            .{ "gtk", "gtk4" },
-            .{ "xlib", "xlib2" },
-        };
-        inline for (gobject_imports) |import| {
-            const name, const module = import;
-            step.root_module.addImport(name, gobject.module(module));
-        }
+    }) orelse return;
+    const gobject_imports = .{
+        .{ "adw", "adw1" },
+        .{ "gdk", "gdk4" },
+        .{ "gio", "gio2" },
+        .{ "glib", "glib2" },
+        .{ "glibunix", "glibunix2" },
+        .{ "gobject", "gobject2" },
+        .{ "graphene", "graphene1" },
+        .{ "gtk", "gtk4" },
+        .{ "xlib", "xlib2" },
+    };
+    inline for (gobject_imports) |import| {
+        const name, const module = import;
+        step.root_module.addImport(name, gobject.module(module));
     }
 
     // GTK C translation
@@ -881,13 +888,22 @@ fn addGtkNg(
     });
 
     if (self.config.x11) {
-        step.root_module.linkSystemLibrary("X11", dynamic_link_opts);
-        if (gobject_) |gobject| {
-            step.root_module.addImport(
-                "gdk_x11",
-                gobject.module("gdkx114"),
-            );
-        }
+        // X11 headers
+        try translate_c.addImportToModule(b, "x11_c", step.root_module, .{
+            .source = .{ .includes = .{ .files = &.{
+                .{ .path = "X11/Xlib.h" },
+                .{ .path = "X11/Xatom.h" },
+                .{ .path = "X11/XKBlib.h" },
+            } } },
+            .target = target,
+            .optimize = optimize,
+            .link_system_libs = &.{"X11"},
+        });
+
+        step.root_module.addImport(
+            "gdk_x11",
+            gobject.module("gdkx114"),
+        );
     }
 
     if (self.config.wayland) wayland: {
@@ -949,7 +965,7 @@ fn addGtkNg(
         step.root_module.addImport("wayland", b.createModule(.{
             .root_source_file = scanner.result,
         }));
-        if (gobject_) |gobject| step.root_module.addImport(
+        step.root_module.addImport(
             "gdk_wayland",
             gobject.module("gdkwayland4"),
         );
@@ -959,10 +975,8 @@ fn addGtkNg(
             .optimize = optimize,
         })) |gtk4_layer_shell| {
             const layer_shell_module = gtk4_layer_shell.module("gtk4-layer-shell");
-            if (gobject_) |gobject| {
-                layer_shell_module.addImport("gtk", gobject.module("gtk4"));
-                layer_shell_module.addImport("gdk", gobject.module("gdk4"));
-            }
+            layer_shell_module.addImport("gtk", gobject.module("gtk4"));
+            layer_shell_module.addImport("gdk", gobject.module("gdk4"));
             step.root_module.addImport(
                 "gtk4-layer-shell",
                 layer_shell_module,
@@ -986,7 +1000,7 @@ fn addGtkNg(
 
     {
         // Get our gresource c/h files and add them to our build.
-        const dist = gtkNgDistResources(b);
+        const dist = gtkDistResources(b);
         const translated = try translate_c.init(b, .{
             .source = .{ .includes = .{
                 .generated_name = "ghostty_gtk_resources_c.h",
@@ -1140,14 +1154,14 @@ pub fn addSimd(
     }
 }
 
-pub const GtkNgResources = struct {
+pub const GtkResources = struct {
     resources_c: DistResource,
     resources_h: DistResource,
 };
 
-/// Memoized result of `gtkNgDistResources`, keyed on the `*std.Build`.
+/// Memoized result of `gtkDistResources`, keyed on the `*std.Build`.
 /// The configure pass is single-threaded, so a file-scope map is enough.
-var gtk_ng_resources: std.AutoHashMapUnmanaged(*std.Build, GtkNgResources) = .empty;
+var gtk_ng_resources: std.AutoHashMapUnmanaged(*std.Build, GtkResources) = .empty;
 
 /// Creates the resources that can be prebuilt for our dist build.
 ///
@@ -1155,14 +1169,14 @@ var gtk_ng_resources: std.AutoHashMapUnmanaged(*std.Build, GtkNgResources) = .em
 /// `GhosttyDist` calls it too. Each call used to build its own copy of the
 /// whole pipeline, and since Zig's cache hashes input *paths* as well as
 /// contents, the copies did not share results downstream.
-pub fn gtkNgDistResources(b: *std.Build) GtkNgResources {
+pub fn gtkDistResources(b: *std.Build) GtkResources {
     if (gtk_ng_resources.get(b)) |cached| return cached;
-    const resources = gtkNgDistResourcesUncached(b);
+    const resources = gtkDistResourcesUncached(b);
     gtk_ng_resources.put(b.allocator, b, resources) catch @panic("OOM");
     return resources;
 }
 
-fn gtkNgDistResourcesUncached(b: *std.Build) GtkNgResources {
+fn gtkDistResourcesUncached(b: *std.Build) GtkResources {
     const gresource = @import("../apprt/gtk/build/gresource.zig");
     const gresource_file_inputs = gresource.file_inputs;
 
@@ -1199,8 +1213,9 @@ fn gtkNgDistResourcesUncached(b: *std.Build) GtkNgResources {
             .link_system_libs = &.{"libadwaita-1"},
         }) catch unreachable;
 
-        // The headers have to satisfy the newest blueprint.
-        var required: struct { major: u16, minor: u16 } = .{ .major = 0, .minor = 0 };
+        // The headers have to satisfy the newest blueprint, and never
+        // less than the oldest libadwaita we support.
+        var required = gresource.minimum_adwaita;
         for (gresource.blueprints) |bp| {
             if (bp.major > required.major or
                 (bp.major == required.major and bp.minor > required.minor))
@@ -1244,6 +1259,12 @@ fn gtkNgDistResourcesUncached(b: *std.Build) GtkNgResources {
                 },
             )));
             compile.step.dependOn(&check_run.step);
+
+            // A run step treats anything on an uncaptured stderr as an
+            // error, so a warning (an unused import, a widget deprecated by
+            // a newer GTK) would fail a blueprint that compiled. Captured,
+            // it is only shown if the compiler exits nonzero.
+            _ = compile.captureStdErr(.{});
 
             _ = ui_files.addCopyFile(ui_file, sub_path);
         }

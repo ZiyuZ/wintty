@@ -116,6 +116,9 @@ var global: Global = .{};
 /// Zig-compatible wrapper that calls through to the stored C callback.
 /// The C callback allocates the pixel data through the provided allocator,
 /// so we can take ownership directly.
+///
+/// Returns `error.InvalidData` if no callback is installed, if the callback
+/// returns false, or if it returns true without setting `data`.
 fn decodePngWrapper(
     alloc: std.mem.Allocator,
     data: []const u8,
@@ -123,7 +126,13 @@ fn decodePngWrapper(
     const func = global.decode_png orelse return error.InvalidData;
 
     const c_alloc = CAllocator.fromZig(&alloc);
-    var out: Image = undefined;
+
+    // Hand the callback a zeroed struct instead of an undefined one. The
+    // callback stores a pointer into it, and runtimes that track pointers
+    // (Go, for example) require the memory to be initialized first. It
+    // also means a callback that returns true without setting `data` is
+    // caught by the null check below. The header documents this guarantee.
+    var out: Image = std.mem.zeroes(Image);
     if (!func(global.userdata, &c_alloc, lib.String.init(data).ptr, data.len, &out)) return error.InvalidData;
 
     const result_data = out.data orelse return error.InvalidData;
@@ -387,56 +396,31 @@ test "set decode_png installs wrapper" {
     try std.testing.expect(terminal_sys.decode_png == null);
 }
 
-test "set decode_jpeg with null clears" {
-    global.decode_jpeg = null;
-    terminal_sys.decode_jpeg = null;
-
-    try std.testing.expectEqual(Result.success, set(.decode_jpeg, null));
-    try std.testing.expect(terminal_sys.decode_jpeg == null);
-}
-
-test "set decode_jpeg installs wrapper" {
+test "decode_png output is zeroed before the callback" {
     const S = struct {
+        var seen: ?Image = null;
         fn decode(_: ?*anyopaque, _: *const CAllocator, _: [*]const u8, _: usize, out: *Image) callconv(lib.calling_conv) bool {
-            out.* = .{ .width = 1, .height = 1, .data = null, .data_len = 0 };
+            // Record what we were given, then report success without
+            // filling anything in.
+            seen = out.*;
             return true;
         }
     };
 
     try std.testing.expectEqual(Result.success, set(
-        .decode_jpeg,
+        .decode_png,
         @ptrCast(&S.decode),
     ));
-    try std.testing.expect(terminal_sys.decode_jpeg != null);
+    defer _ = set(.decode_png, null);
 
-    try std.testing.expectEqual(Result.success, set(.decode_jpeg, null));
-    try std.testing.expect(terminal_sys.decode_jpeg == null);
-}
+    // Success with no data is rejected rather than read as garbage.
+    try std.testing.expectError(
+        error.InvalidData,
+        decodePngWrapper(std.testing.allocator, "png"),
+    );
 
-test "set decode_gif with null clears" {
-    global.decode_gif = null;
-    terminal_sys.decode_gif = null;
-
-    try std.testing.expectEqual(Result.success, set(.decode_gif, null));
-    try std.testing.expect(terminal_sys.decode_gif == null);
-}
-
-test "set decode_gif installs wrapper" {
-    const S = struct {
-        fn decode(_: ?*anyopaque, _: *const CAllocator, _: [*]const u8, _: usize, out: *Image) callconv(lib.calling_conv) bool {
-            out.* = .{ .width = 1, .height = 1, .data = null, .data_len = 0 };
-            return true;
-        }
-    };
-
-    try std.testing.expectEqual(Result.success, set(
-        .decode_gif,
-        @ptrCast(&S.decode),
-    ));
-    try std.testing.expect(terminal_sys.decode_gif != null);
-
-    try std.testing.expectEqual(Result.success, set(.decode_gif, null));
-    try std.testing.expect(terminal_sys.decode_gif == null);
+    // The callback saw an all-zero struct.
+    try std.testing.expectEqual(std.mem.zeroes(Image), S.seen.?);
 }
 
 test "set log with null clears" {
@@ -588,4 +572,56 @@ test "set userdata" {
     // Clear it.
     try std.testing.expectEqual(Result.success, set(.userdata, null));
     try std.testing.expect(global.userdata == null);
+}
+
+test "set decode_jpeg with null clears" {
+    global.decode_jpeg = null;
+    terminal_sys.decode_jpeg = null;
+
+    try std.testing.expectEqual(Result.success, set(.decode_jpeg, null));
+    try std.testing.expect(terminal_sys.decode_jpeg == null);
+}
+
+test "set decode_jpeg installs wrapper" {
+    const S = struct {
+        fn decode(_: ?*anyopaque, _: *const CAllocator, _: [*]const u8, _: usize, out: *Image) callconv(lib.calling_conv) bool {
+            out.* = .{ .width = 1, .height = 1, .data = null, .data_len = 0 };
+            return true;
+        }
+    };
+
+    try std.testing.expectEqual(Result.success, set(
+        .decode_jpeg,
+        @ptrCast(&S.decode),
+    ));
+    try std.testing.expect(terminal_sys.decode_jpeg != null);
+
+    try std.testing.expectEqual(Result.success, set(.decode_jpeg, null));
+    try std.testing.expect(terminal_sys.decode_jpeg == null);
+}
+
+test "set decode_gif with null clears" {
+    global.decode_gif = null;
+    terminal_sys.decode_gif = null;
+
+    try std.testing.expectEqual(Result.success, set(.decode_gif, null));
+    try std.testing.expect(terminal_sys.decode_gif == null);
+}
+
+test "set decode_gif installs wrapper" {
+    const S = struct {
+        fn decode(_: ?*anyopaque, _: *const CAllocator, _: [*]const u8, _: usize, out: *Image) callconv(lib.calling_conv) bool {
+            out.* = .{ .width = 1, .height = 1, .data = null, .data_len = 0 };
+            return true;
+        }
+    };
+
+    try std.testing.expectEqual(Result.success, set(
+        .decode_gif,
+        @ptrCast(&S.decode),
+    ));
+    try std.testing.expect(terminal_sys.decode_gif != null);
+
+    try std.testing.expectEqual(Result.success, set(.decode_gif, null));
+    try std.testing.expect(terminal_sys.decode_gif == null);
 }

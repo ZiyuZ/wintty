@@ -96,7 +96,7 @@ pub fn resourcesDir(alloc: Allocator) !ResourcesDir {
     }
 
     // Get the path to our running binary
-    var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var exe_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const exe: []const u8 = exe_buf[0 .. std.process.executablePath(
         global.io(),
         &exe_buf,
@@ -174,7 +174,7 @@ fn resourcesDirFromExeBy(
     comptime probeable: fn ([]const u8) bool,
 ) !?ResourcesDir {
     var exe = exe_path;
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    var dir_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     var climbed: usize = 0;
     while (std.fs.path.dirname(exe)) |dir| {
         exe = dir;
@@ -322,7 +322,7 @@ fn validResourcesDir(path: []const u8) bool {
 fn hasSentinelBeside(path: []const u8) bool {
     const parent = std.fs.path.dirname(path) orelse return false;
 
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     inline for (sentinels) |sentinel| {
         if (std.fmt.bufPrint(&buf, "{s}/{s}", .{ parent, sentinel })) |p| {
             if (std.Io.Dir.cwd().statFile(global.io(), p, .{})) |stat| {
@@ -377,7 +377,7 @@ fn createPackagedLayout(dir: std.Io.Dir) !void {
     try dir.writeFile(io, .{ .sub_path = "bin/wintty.exe", .data = "" });
 
     // The sentinel, whatever this platform detects the tree by.
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const sentinel_path = try std.fmt.bufPrint(
         &buf,
         share_dir ++ "/{s}",
@@ -538,7 +538,7 @@ test "resourcesDirFromExe windows: the climb consults the probe predicate" {
     try tmp.dir.createDirPath(testing.io, "install/bin");
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "install/bin/Wintty.exe", .data = "" });
 
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const sentinel_sub = try std.fmt.bufPrint(
         &buf,
         "install/" ++ share_dir ++ "/{s}",
@@ -578,7 +578,7 @@ test "resourcesDirFromExe windows: a tree planted above the install is not adopt
     // The planted tree at the third ancestor (the `C:\ProgramData` of the
     // scenario): sentinel first, then the payload a planted tree exists to
     // deliver.
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const planted_sentinel = try std.fmt.bufPrint(
         &buf,
         share_dir ++ "/{s}",
@@ -736,7 +736,7 @@ test "validResourcesDir non-windows: takes an existing absolute directory" {
     var td = try TempDir.init();
     defer td.deinit();
 
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const len = try td.dir.realPath(testing.io, &buf);
     try testing.expect(validResourcesDir(buf[0..len]));
 }

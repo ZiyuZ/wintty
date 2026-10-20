@@ -3,9 +3,7 @@ const builtin = @import("builtin");
 const build_config = @import("../build_config.zig");
 const global = @import("../global.zig");
 
-const c = @cImport({
-    @cInclude("unistd.h");
-});
+const c = if (builtin.os.tag != .windows) @import("posix_c") else {};
 
 /// Returns true if the program was launched from a desktop environment.
 ///

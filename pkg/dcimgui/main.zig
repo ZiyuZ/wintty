@@ -1,18 +1,11 @@
 pub const build_options = @import("build_options");
 
-pub const c = @cImport({
-    // These must match the defines the library is compiled with (see
-    // build.zig); otherwise the cImport-translated structs get a different
-    // layout than the compiled code and writing their fields corrupts memory.
-    // IMGUI_DISABLE_OBSOLETE_FUNCTIONS in particular removes obsolete fields,
-    // so omitting it here made Zig's ImGuiIO 32 bytes larger than the real
-    // allocation and per-frame io writes clobbered adjacent heap.
-    @cDefine("IMGUI_USE_WCHAR32", "1");
-    @cDefine("IMGUI_HAS_DOCK", "1");
-    @cDefine("IMGUI_DISABLE_OBSOLETE_FUNCTIONS", "1");
-    if (build_options.freetype) @cDefine("IMGUI_ENABLE_FREETYPE", "1");
-    @cInclude("dcimgui.h");
-});
+// The translated declarations must be built with the same defines the
+// library is compiled with; build.zig feeds one define_flags list to both
+// the C sources and this module. When that broke, ImGuiIO came out 32
+// bytes larger than the real allocation and per-frame io writes clobbered
+// adjacent heap. If you touch defines, touch them there, once.
+pub const c = @import("dcimgui_c");
 
 // OpenGL3 backend
 pub extern fn ImGui_ImplOpenGL3_Init(glsl_version: ?[*:0]const u8) callconv(.c) bool;
@@ -86,6 +79,10 @@ extern fn ghostty_ImGuiStyle_size() callconv(.c) usize;
 // Internal API types and functions from dcimgui_internal.h
 // We declare these manually because the internal header contains bitfields
 // that Zig's cImport cannot translate.
+
+// Internal API types and functions from dcimgui_internal.h We declare these
+// manually because the internal header contains bitfields that translate-c has
+// trouble with.
 pub const ImGuiDockNodeFlagsPrivate = struct {
     pub const DockSpace: c.ImGuiDockNodeFlags = 1 << 10;
     pub const CentralNode: c.ImGuiDockNodeFlags = 1 << 11;

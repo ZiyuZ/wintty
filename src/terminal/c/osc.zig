@@ -15,6 +15,9 @@ pub const Command = ?*osc.Command;
 /// C: GhosttyOscCommandType
 pub const CommandType = osc.Command.Key;
 
+/// C: GhosttyOscTerminator
+pub const Terminator = osc.Terminator.C;
+
 pub fn new(
     alloc_: ?*const CAllocator,
     result: *Parser,
@@ -47,6 +50,34 @@ pub fn end(parser_: Parser, terminator: u8) callconv(lib.calling_conv) Command {
     return parser_.?.end(terminator);
 }
 
+/// C: GhosttyOscOption
+pub const Option = enum(c_int) {
+    unknown_max_bytes = 0,
+};
+
+pub fn set(
+    parser_: Parser,
+    option: Option,
+    value: ?*const anyopaque,
+) callconv(lib.calling_conv) Result {
+    if (comptime std.debug.runtime_safety) {
+        _ = std.enums.fromInt(Option, @intFromEnum(option)) orelse {
+            log.warn("osc_set invalid option value={d}", .{@intFromEnum(option)});
+            return .invalid_value;
+        };
+    }
+
+    const parser = parser_ orelse return .invalid_value;
+    switch (option) {
+        .unknown_max_bytes => {
+            const ptr: ?*const usize = @ptrCast(@alignCast(value));
+            parser.unknown_max_bytes = if (ptr) |v| v.* else 0;
+        },
+    }
+
+    return .success;
+}
+
 pub fn commandType(command_: Command) callconv(lib.calling_conv) CommandType {
     const command = command_ orelse return .invalid;
     return command.*;
@@ -56,6 +87,9 @@ pub fn commandType(command_: Command) callconv(lib.calling_conv) CommandType {
 pub const CommandData = enum(c_int) {
     invalid = 0,
     change_window_title_str = 1,
+    unknown_content = 8,
+    unknown_truncated = 9,
+    unknown_terminator = 10,
 
     // OSC 7777 prompt report. Each field is queried on its own, and a query
     // for a field the report did not carry returns false: absent is a real
@@ -83,6 +117,9 @@ pub const CommandData = enum(c_int) {
             => [*:0]const u8,
             .prompt_report_exit_code_i64 => i64,
             .prompt_report_git_dirty_bool => bool,
+            .unknown_content => lib.String,
+            .unknown_truncated => bool,
+            .unknown_terminator => Terminator,
         };
     }
 };
@@ -153,6 +190,19 @@ fn commandDataTyped(
             .prompt_report => |v| out.* = v.git_dirty orelse return false,
             else => return false,
         },
+
+        .unknown_content => switch (command.*) {
+            .unknown => |v| out.* = .init(v.content),
+            else => return false,
+        },
+        .unknown_truncated => switch (command.*) {
+            .unknown => |v| out.* = v.truncated,
+            else => return false,
+        },
+        .unknown_terminator => switch (command.*) {
+            .unknown => |v| out.* = v.terminator.cval(),
+            else => return false,
+        },
     }
 
     return true;
@@ -171,6 +221,12 @@ test "alloc" {
 test "command type null" {
     const testing = std.testing;
     try testing.expectEqual(.invalid, commandType(null));
+}
+
+test "command data null" {
+    const testing = std.testing;
+    var title: [*:0]const u8 = undefined;
+    try testing.expect(!commandData(null, .change_window_title_str, @ptrCast(&title)));
 }
 
 test "change window title" {
@@ -193,6 +249,53 @@ test "change window title" {
     var title: [*:0]const u8 = undefined;
     try testing.expect(commandData(cmd, .change_window_title_str, @ptrCast(&title)));
     try testing.expectEqualStrings("a", std.mem.span(title));
+}
+
+test "unknown" {
+    const testing = std.testing;
+    var p: Parser = undefined;
+    try testing.expectEqual(Result.success, new(
+        &lib.alloc.test_allocator,
+        &p,
+    ));
+    defer free(p);
+
+    const max_bytes: usize = 8;
+    try testing.expectEqual(Result.success, set(
+        p,
+        .unknown_max_bytes,
+        @ptrCast(&max_bytes),
+    ));
+
+    // Parse it
+    for ("7400;x") |ch| next(p, ch);
+    const cmd = end(p, 0x07);
+    try testing.expectEqual(.unknown, commandType(cmd));
+
+    var content: lib.String = undefined;
+    try testing.expect(commandData(cmd, .unknown_content, @ptrCast(&content)));
+    try testing.expectEqualStrings("7400;x", content.ptr[0..content.len]);
+
+    var truncated: bool = true;
+    try testing.expect(commandData(cmd, .unknown_truncated, @ptrCast(&truncated)));
+    try testing.expect(!truncated);
+
+    var terminator: osc.Terminator.C = .st;
+    try testing.expect(commandData(cmd, .unknown_terminator, @ptrCast(&terminator)));
+    try testing.expectEqual(osc.Terminator.C.bel, terminator);
+
+    // Other commands can't read unknown data.
+    reset(p);
+    for ("0;a") |ch| next(p, ch);
+    const title_cmd = end(p, 0x07);
+    try testing.expectEqual(.change_window_title, commandType(title_cmd));
+    try testing.expect(!commandData(title_cmd, .unknown_content, @ptrCast(&content)));
+
+    // A NULL value disables capture again.
+    try testing.expectEqual(Result.success, set(p, .unknown_max_bytes, null));
+    reset(p);
+    for ("7400;x") |ch| next(p, ch);
+    try testing.expectEqual(.invalid, commandType(end(p, 0x07)));
 }
 
 test "prompt report" {

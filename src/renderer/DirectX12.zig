@@ -28,6 +28,7 @@ const init_log = std.log.scoped(.surface_init);
 // --- GraphicsAPI contract: types ---
 
 pub const GraphicsAPI = DirectX12;
+pub const Device = @import("directx12/app_device.zig").Device;
 pub const Target = @import("directx12/Target.zig");
 pub const Frame = @import("directx12/Frame.zig");
 pub const RenderPass = @import("directx12/RenderPass.zig");
@@ -310,7 +311,17 @@ pub fn warmup() void {
     device.warmup();
 }
 
-pub fn init(alloc: Allocator, opts: rendererpkg.Options) !DirectX12 {
+pub fn init(
+    alloc: Allocator,
+    app_device: *Device,
+    opts: rendererpkg.Options,
+) !DirectX12 {
+    // The app-scoped device is an attach point for backends that own
+    // process-wide GPU state at that granularity; the DX12 backend
+    // manages its real device per-renderer through device.zig (see
+    // directx12/app_device.zig), so there is nothing to take from it
+    // here.
+    _ = app_device;
     var result = DirectX12{ .allocator = alloc, .init_started = opts.init_started };
 
     if (comptime builtin.os.tag != .windows) {
