@@ -37,7 +37,7 @@ jobs:
           $src = "windows/Ghostty/bin/x64/Release/net10.0-windows10.0.19041.0"
           New-Item -ItemType Directory -Force dist-out | Out-Null
           Copy-Item "$src/*" dist-out -Recurse -Force
-          Copy-Item "zig-out/bin/ghostty.dll" dist-out -Force
+          Copy-Item "zig-out/lib/ghostty.dll" dist-out -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
