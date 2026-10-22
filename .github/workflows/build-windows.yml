@@ -35,21 +35,9 @@ jobs:
         shell: pwsh
         run: |
           $src = "windows/Ghostty/bin/x64/Release/net10.0-windows10.0.19041.0"
-          $dst = "dist-out"
-
-          if (!(Test-Path "$src/Wintty.exe")) {
-            throw "Wintty.exe not found!"
-          }
-
-          New-Item -ItemType Directory -Force $dst | Out-Null
-          Copy-Item "$src/*" $dst -Recurse -Force
-
-          Write-Host "Collected files:"
-          Get-ChildItem $dst
-
-          if (!(Test-Path "$dst/ghostty.dll")) {
-            Write-Warning "ghostty.dll is missing from application output!"
-          }
+          New-Item -ItemType Directory -Force dist-out | Out-Null
+          Copy-Item "$src/*" dist-out -Recurse -Force
+          Copy-Item "zig-out/lib/ghostty.dll" dist-out -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
