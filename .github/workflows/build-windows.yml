@@ -1,0 +1,46 @@
+
+name: Build Wintty
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Setup Just
+        uses: taiki-e/install-action@just
+
+      - name: Build Ghostty DLL
+        run: just build-dll-release
+
+      - name: Build Windows application
+        run: just build-win-release
+
+      - name: Collect binaries
+        shell: pwsh
+        run: |
+          $src = "windows/Ghostty/bin/x64/Release/net10.0-windows10.0.19041.0"
+          New-Item -ItemType Directory -Force dist-out | Out-Null
+          Copy-Item "$src/*" dist-out -Recurse -Force
+          Copy-Item "zig-out/bin/ghostty.dll" dist-out -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Wintty-Windows-x64
+          path: dist-out/
